@@ -103,7 +103,8 @@ class RewardModelTrainer(ABC):
         if args.eval_steps == -1:
             args.eval_steps = num_update_steps_per_epoch  # Evaluate once per epoch
         if args.save_steps == -1:
-            args.save_steps = float("inf")  # do not save ckpt
+            args.save_steps = num_update_steps_per_epoch
+            # args.save_steps = float("inf")  # do not save ckpt
 
         # Restore step and start_epoch
         step = consumed_samples // args.train_batch_size * self.strategy.accumulated_gradient + 1
