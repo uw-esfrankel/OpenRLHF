@@ -89,7 +89,12 @@ def train(args):
 
     # scheduler
     num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
-    max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
+    if args.force_use_num_iters:
+        max_steps = args.force_use_num_iters
+        # set max_epochs to the ceiling of the number of iterations
+        args.max_epochs = math.ceil(args.force_use_num_iters / num_update_steps_per_epoch)
+    else:
+        max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
 
     scheduler = get_scheduler(
         "cosine_with_min_lr",
@@ -149,8 +154,10 @@ if __name__ == "__main__":
     # Checkpoint
     parser.add_argument("--save_path", type=str, default="./ckpt")
     parser.add_argument("--save_steps", type=int, default=-1)
+    parser.add_argument("--save_pct", type=float, default=None)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--eval_steps", type=int, default=-1)
+    parser.add_argument("--eval_pct", type=float, default=None)
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_rm")
     parser.add_argument("--max_ckpt_num", type=int, default=3)
     parser.add_argument("--max_ckpt_mem", type=int, default=1e8)
@@ -195,6 +202,7 @@ if __name__ == "__main__":
 
     # RM training
     parser.add_argument("--max_epochs", type=int, default=1)
+    parser.add_argument("--force_use_num_global_iters", type=int, default=None)
     parser.add_argument("--aux_loss_coef", type=float, default=0, help="MoE balancing loss")
     parser.add_argument("--compute_fp32_loss", action="store_true", default=False)
     parser.add_argument("--margin_loss", action="store_true", default=False)
@@ -241,6 +249,9 @@ if __name__ == "__main__":
 
     # ModelScope parameters
     parser.add_argument("--use_ms", action="store_true", default=False)
+
+    # Push model to HF hub
+    parser.add_argument("--push_to_hub", action="store_true", default=False)
 
     args = parser.parse_args()
 

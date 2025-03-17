@@ -4,6 +4,7 @@ from abc import ABC
 import torch
 from torch.optim import Optimizer
 from tqdm import tqdm
+from huggingface_hub import HfApi
 
 from openrlhf.models import LogExpLoss, PairWiseLoss
 from openrlhf.utils.distributed_sampler import DistributedSampler
@@ -100,10 +101,16 @@ class RewardModelTrainer(ABC):
 
     def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
         # get eval and save steps
-        if args.eval_steps == -1:
+        if args.eval_steps == -1 and args.eval_pct is None:
             args.eval_steps = num_update_steps_per_epoch  # Evaluate once per epoch
-        if args.save_steps == -1:
+        elif args.eval_steps == -1 and args.eval_pct is not None:
+            assert 0 < args.eval_pct <= 1, "eval_pct must be between 0 and 1"
+            args.eval_steps = int(num_update_steps_per_epoch * args.eval_pct)
+        if args.save_steps == -1 and args.save_pct is None:
             args.save_steps = num_update_steps_per_epoch
+        elif args.save_steps == -1 and args.save_pct is not None:
+            assert 0 < args.save_pct <= 1, "save_pct must be between 0 and 1"
+            args.save_steps = int(num_update_steps_per_epoch * args.save_pct)
             # args.save_steps = float("inf")  # do not save ckpt
 
         # Restore step and start_epoch
@@ -229,6 +236,19 @@ class RewardModelTrainer(ABC):
             self.strategy.save_ckpt(
                 self.model, args.ckpt_path, tag, args.max_ckpt_num, args.max_ckpt_mem, client_states
             )
+            if args.push_to_hub:
+                hf_model_name = args.wandb_run_name
+                api = HfApi()
+                # check if repo exists
+                if not api.repo_exists(hf_model_name):
+                    api.create_repo(hf_model_name)
+                api.upload_folder(
+                    folder_path=args.ckpt_path,
+                    repo_id=hf_model_name,
+                    repo_type="model",
+                    use_auth_token=True,
+                    revision=tag,
+                )
 
     def evaluate(self, eval_dataloader, steps=0):
         step_bar = tqdm(
