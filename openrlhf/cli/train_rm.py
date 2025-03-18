@@ -89,10 +89,10 @@ def train(args):
 
     # scheduler
     num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
-    if args.force_use_num_iters:
-        max_steps = args.force_use_num_iters
+    if args.force_use_num_global_iters:
+        max_steps = args.force_use_num_global_iters
         # set max_epochs to the ceiling of the number of iterations
-        args.max_epochs = math.ceil(args.force_use_num_iters / num_update_steps_per_epoch)
+        args.max_epochs = math.ceil(args.force_use_num_global_iters / num_update_steps_per_epoch)
     else:
         max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
 
@@ -120,6 +120,8 @@ def train(args):
         consumed_samples = states["consumed_samples"]
         strategy.print(f"Loaded the checkpoint: {args.ckpt_path}, consumed_samples: {consumed_samples}")
 
+    if args.save_path is None:
+        args.save_path = args.wandb_run_name
     os.makedirs(args.save_path, exist_ok=True)
 
     # batch_size here is micro_batch_size * 2
@@ -153,8 +155,10 @@ if __name__ == "__main__":
 
     # Checkpoint
     parser.add_argument("--save_path", type=str, default="./ckpt")
-    parser.add_argument("--save_steps", type=int, default=-1)
-    parser.add_argument("--save_pct", type=float, default=None)
+    parser.add_argument("--save_ckpt_steps", type=int, default=-1)
+    parser.add_argument("--save_ckpt_pct", type=float, default=None)
+    parser.add_argument("--save_model_steps", type=int, default=-1)
+    parser.add_argument("--save_model_pct", type=float, default=None)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--eval_steps", type=int, default=-1)
     parser.add_argument("--eval_pct", type=float, default=None)

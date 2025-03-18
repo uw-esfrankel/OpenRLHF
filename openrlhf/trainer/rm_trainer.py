@@ -100,18 +100,27 @@ class RewardModelTrainer(ABC):
             self._tensorboard = SummaryWriter(log_dir=log_dir)
 
     def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
-        # get eval and save steps
+        if args.save_model_steps == -1 and args.save_model_pct is None:
+            args.save_model_steps = num_update_steps_per_epoch
+        elif args.save_model_steps == -1 and args.save_model_pct is not None:
+            assert 0 < args.save_model_pct <= 1, "save_model_pct must be between 0 and 1"
+            args.save_model_steps = int(num_update_steps_per_epoch * args.save_model_pct)
+        print(f"Saving model parameters every {args.save_model_steps} global steps")
+        
         if args.eval_steps == -1 and args.eval_pct is None:
             args.eval_steps = num_update_steps_per_epoch  # Evaluate once per epoch
         elif args.eval_steps == -1 and args.eval_pct is not None:
             assert 0 < args.eval_pct <= 1, "eval_pct must be between 0 and 1"
             args.eval_steps = int(num_update_steps_per_epoch * args.eval_pct)
-        if args.save_steps == -1 and args.save_pct is None:
-            args.save_steps = num_update_steps_per_epoch
-        elif args.save_steps == -1 and args.save_pct is not None:
-            assert 0 < args.save_pct <= 1, "save_pct must be between 0 and 1"
-            args.save_steps = int(num_update_steps_per_epoch * args.save_pct)
-            # args.save_steps = float("inf")  # do not save ckpt
+        print(f"Evaluating every {args.eval_steps} global steps")
+            
+        if args.save_ckpt_steps == -1 and args.save_ckpt_pct is None:
+            args.save_ckpt_steps = num_update_steps_per_epoch
+        elif args.save_ckpt_steps == -1 and args.save_ckpt_pct is not None:
+            assert 0 < args.save_ckpt_pct <= 1, "save_ckpt_pct must be between 0 and 1"
+            args.save_ckpt_steps = int(num_update_steps_per_epoch * args.save_ckpt_pct)
+        print(f"Saving training state every {args.save_ckpt_steps} global steps")
+        print(f"Num update steps per epoch: {num_update_steps_per_epoch}")
 
         # Restore step and start_epoch
         step = consumed_samples // args.train_batch_size * self.strategy.accumulated_gradient + 1
@@ -231,12 +240,19 @@ class RewardModelTrainer(ABC):
                 self.evaluate(self.eval_dataloader, global_step)
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity on whole dev dataset as metric
-        if global_step % args.save_steps == 0:
+        if global_step % args.save_ckpt_steps == 0:
             tag = f"global_step{global_step}"
             self.strategy.save_ckpt(
                 self.model, args.ckpt_path, tag, args.max_ckpt_num, args.max_ckpt_mem, client_states
             )
+        
+        if global_step % args.save_model_steps == 0:
+            print(f"saving model at global step {global_step}")
+            self.strategy.save_model(
+                self.model, self.tokenizer, args.save_path
+            )
             if args.push_to_hub:
+                print(f"uploading model to huggingface")
                 hf_model_name = args.wandb_run_name
                 api = HfApi()
                 # check if repo exists
