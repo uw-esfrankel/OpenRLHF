@@ -100,39 +100,50 @@ class RewardModelTrainer(ABC):
             self._tensorboard = SummaryWriter(log_dir=log_dir)
 
     def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
-        if args.num_model_saves == 0:
-            
-        
-        if args.save_model_steps == -1 and args.save_model_pct is None:
-            args.save_model_steps = num_update_steps_per_epoch
-        elif args.save_model_steps == -1 and args.save_model_pct is not None:
-            assert 0 < args.save_model_pct <= 1, "save_model_pct must be between 0 and 1"
-            args.save_model_steps = int(num_update_steps_per_epoch * args.save_model_pct)
-        print(f"Saving model parameters every {args.save_model_steps} global steps")
+        # Modify training loop to use force_use_num_global_iters if specified
+        if args.force_use_num_global_iters is not None:
+            total_iters = args.force_use_num_global_iters
+            # Calculate required epochs based on iterations per epoch
+            required_epochs = (total_iters * self.strategy.accumulated_gradient) // len(self.train_dataloader) + 1
+            self.epochs = required_epochs
+            self.strategy.print(f"Training for exactly {total_iters} iterations (across {required_epochs} epochs)")
+        else:
+            total_iters = self.epochs * num_update_steps_per_epoch       
+
+        if args.num_model_saves is None:
+            # Save once per epoch
+            args.save_model_global_step_nums = [num_update_steps_per_epoch * (i + 1) for i in range(self.epochs)]
+        else:
+            # We want args.num_model_saves in evenly spaced steps
+            args.save_model_global_step_nums = [int(total_iters * (i + 1) / args.num_model_saves) for i in range(args.num_model_saves)]
+        self.strategy.print(f"Saving model parameters at global steps {args.save_model_global_step_nums}")
+
         
         if args.eval_steps == -1 and args.eval_pct is None:
             args.eval_steps = num_update_steps_per_epoch  # Evaluate once per epoch
         elif args.eval_steps == -1 and args.eval_pct is not None:
             assert 0 < args.eval_pct <= 1, "eval_pct must be between 0 and 1"
-            args.eval_steps = int(num_update_steps_per_epoch * args.eval_pct)
-        print(f"Evaluating every {args.eval_steps} global steps")
+            args.eval_steps = int(total_iters * args.eval_pct)
+        self.strategy.print(f"Evaluating every {args.eval_steps} global steps")
             
         if args.save_ckpt_steps == -1 and args.save_ckpt_pct is None:
-            args.save_ckpt_steps = num_update_steps_per_epoch
+            args.save_ckpt_steps = num_update_steps_per_epoch # Save once per epoch
         elif args.save_ckpt_steps == -1 and args.save_ckpt_pct is not None:
             assert 0 < args.save_ckpt_pct <= 1, "save_ckpt_pct must be between 0 and 1"
-            args.save_ckpt_steps = int(num_update_steps_per_epoch * args.save_ckpt_pct)
-        print(f"Saving training state every {args.save_ckpt_steps} global steps")
-        print(f"Num update steps per epoch: {num_update_steps_per_epoch}")
+            args.save_ckpt_steps = int(total_iters * args.save_ckpt_pct)
+        self.strategy.print(f"Saving training state every {args.save_ckpt_steps} global steps")
+        self.strategy.print(f"There are {num_update_steps_per_epoch} updates per epoch and a total of {total_iters} global steps")
 
         # Restore step and start_epoch
         step = consumed_samples // args.train_batch_size * self.strategy.accumulated_gradient + 1
         start_epoch = consumed_samples // args.train_batch_size // num_update_steps_per_epoch
         consumed_samples = consumed_samples % (num_update_steps_per_epoch * args.train_batch_size)
-
+        
         epoch_bar = tqdm(range(start_epoch, self.epochs), desc="Train epoch", disable=not self.strategy.is_rank_0())
         acc_sum = 0
         loss_sum = 0
+        global_step = step // self.strategy.accumulated_gradient
+        
         for epoch in range(start_epoch, self.epochs):
             if isinstance(self.train_dataloader.sampler, DistributedSampler):
                 self.train_dataloader.sampler.set_epoch(
@@ -148,6 +159,15 @@ class RewardModelTrainer(ABC):
 
             self.model.train()
             for data in self.train_dataloader:
+                # Check if we've reached desired number of iterations
+                if args.force_use_num_global_iters is not None and global_step >= args.force_use_num_global_iters:
+                    self.strategy.print(f"Reached {args.force_use_num_global_iters} iterations, stopping training")
+                    if self._wandb is not None and self.strategy.is_rank_0():
+                        self._wandb.finish()
+                    if self._tensorboard is not None and self.strategy.is_rank_0():
+                        self._tensorboard.close()
+                    return
+
                 if not self.packing_samples:
                     chosen_ids, c_mask, reject_ids, r_mask, margin = data
                     chosen_ids = chosen_ids.squeeze(1).to(torch.cuda.current_device())
@@ -249,13 +269,15 @@ class RewardModelTrainer(ABC):
                 self.model, args.ckpt_path, tag, args.max_ckpt_num, args.max_ckpt_mem, client_states
             )
         
-        if global_step % args.save_model_steps == 0:
+        # Save model at specified steps
+        if global_step in args.save_model_global_step_nums:
+            if len(self.eval_dataloader) > 0:
+                self.evaluate(self.eval_dataloader, global_step)
+
             if self.strategy.is_rank_0():
                 print(f"saving model at global step {global_step}")
             
             revision = f"step-{global_step}"
-            if args.save_model_pct is not None:
-                revision += f"-pct-{args.save_model_pct}"
             save_path = os.path.join(args.save_path, revision)
             
             # The upload will happen in a background process
