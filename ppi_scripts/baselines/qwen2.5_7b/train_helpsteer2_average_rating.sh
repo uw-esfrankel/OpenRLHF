@@ -23,9 +23,9 @@ openrlhf.cli.train_rm \
    --use_wandb $WANDB_TOKEN \
    --wandb_project ppi-rm-training-test \
    --wandb_run_name TEST_RUN_baseline-qwen2.5-7b-helpsteer2-average_rating-rm-$(date +%Y%m%d-%H%M%S) \
-   --save_ckpt_pct 0.2 \
    --save_model_pct 0.25 \
-   --eval_pct 0.25
+   --eval_pct 0.25 \
+   --push_to_hub
 EOF
 
 

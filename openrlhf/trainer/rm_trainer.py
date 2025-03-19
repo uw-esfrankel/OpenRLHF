@@ -100,6 +100,9 @@ class RewardModelTrainer(ABC):
             self._tensorboard = SummaryWriter(log_dir=log_dir)
 
     def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
+        if args.num_model_saves == 0:
+            
+        
         if args.save_model_steps == -1 and args.save_model_pct is None:
             args.save_model_steps = num_update_steps_per_epoch
         elif args.save_model_steps == -1 and args.save_model_pct is not None:
@@ -247,24 +250,24 @@ class RewardModelTrainer(ABC):
             )
         
         if global_step % args.save_model_steps == 0:
-            print(f"saving model at global step {global_step}")
+            if self.strategy.is_rank_0():
+                print(f"saving model at global step {global_step}")
+            
+            revision = f"step-{global_step}"
+            if args.save_model_pct is not None:
+                revision += f"-pct-{args.save_model_pct}"
+            save_path = os.path.join(args.save_path, revision)
+            
+            # The upload will happen in a background process
+            repo_name = f"esfrankel17/{args.wandb_run_name}" if args.push_to_hub else None
+            
             self.strategy.save_model(
-                self.model, self.tokenizer, args.save_path
+                self.model, 
+                self.tokenizer, 
+                save_path,
+                push_to_hub=args.push_to_hub,
+                repo_name=repo_name
             )
-            if args.push_to_hub:
-                print(f"uploading model to huggingface")
-                hf_model_name = args.wandb_run_name
-                api = HfApi()
-                # check if repo exists
-                if not api.repo_exists(hf_model_name):
-                    api.create_repo(hf_model_name)
-                api.upload_folder(
-                    folder_path=args.ckpt_path,
-                    repo_id=hf_model_name,
-                    repo_type="model",
-                    use_auth_token=True,
-                    revision=tag,
-                )
 
     def evaluate(self, eval_dataloader, steps=0):
         step_bar = tqdm(

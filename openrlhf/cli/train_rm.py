@@ -89,18 +89,13 @@ def train(args):
 
     # scheduler
     num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
-    if args.force_use_num_global_iters:
-        max_steps = args.force_use_num_global_iters
-        # set max_epochs to the ceiling of the number of iterations
-        args.max_epochs = math.ceil(args.force_use_num_global_iters / num_update_steps_per_epoch)
-    else:
-        max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
+    args.max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
 
     scheduler = get_scheduler(
         "cosine_with_min_lr",
         optim,
-        num_warmup_steps=math.ceil(max_steps * args.lr_warmup_ratio),
-        num_training_steps=max_steps,
+        num_warmup_steps=math.ceil(args.max_steps * args.lr_warmup_ratio),
+        num_training_steps=args.max_steps,
         scheduler_specific_kwargs={"min_lr": args.learning_rate * 0.1},
     )
 
@@ -153,15 +148,19 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    # Checkpoint
-    parser.add_argument("--save_path", type=str, default="./ckpt")
+    # Hook frequencies
     parser.add_argument("--save_ckpt_steps", type=int, default=-1)
     parser.add_argument("--save_ckpt_pct", type=float, default=None)
-    parser.add_argument("--save_model_steps", type=int, default=-1)
-    parser.add_argument("--save_model_pct", type=float, default=None)
+    
+    parser.add_argument("--num_model_saves", type=float, default=None)
+    
     parser.add_argument("--logging_steps", type=int, default=1)
+    
     parser.add_argument("--eval_steps", type=int, default=-1)
     parser.add_argument("--eval_pct", type=float, default=None)
+    
+    # Checkpoint
+    parser.add_argument("--save_path", type=str, default="./model_weights")
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_rm")
     parser.add_argument("--max_ckpt_num", type=int, default=3)
     parser.add_argument("--max_ckpt_mem", type=int, default=1e8)
