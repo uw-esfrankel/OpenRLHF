@@ -117,7 +117,6 @@ class RewardModelTrainer(ABC):
             # We want args.num_model_saves in evenly spaced steps
             args.save_model_global_step_nums = [int(total_iters * (i + 1) / args.num_model_saves) for i in range(args.num_model_saves)]
         self.strategy.print(f"Saving model parameters at global steps {args.save_model_global_step_nums}")
-
         
         if args.eval_steps == -1 and args.eval_pct is None:
             args.eval_steps = num_update_steps_per_epoch  # Evaluate once per epoch
