@@ -8,7 +8,7 @@ from transformers.trainer import get_scheduler
 from openrlhf.datasets import RewardDataset
 from openrlhf.models import get_llm_for_sequence_regression
 from openrlhf.trainer import RewardModelTrainer
-from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer
+from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer, create_raw_ppi_datasets
 
 
 def train(args):
@@ -41,6 +41,23 @@ def train(args):
 
     # configure optimizer
     optim = strategy.create_optimizer(model, lr=args.learning_rate, betas=args.adam_betas, weight_decay=args.l2)
+    
+    train_dataset, eval_dataset = create_raw_ppi_datasets(
+        dataset=args.dataset,
+        percent_train=args.percent_train,
+        percent_val=args.percent_val,
+        percent_test=args.percent_test,
+        train_split=args.train_split,
+        target_dataset=args.target_dataset,
+        target_split=args.target_split,
+        percent_gold_label=args.percent_gold_label,
+        weak_label_model=args.weak_label_model,
+        strategy=strategy,
+        seed=args.seed,
+        debug=args.debug
+    )
+    
+    breakpoint()
 
     # prepare for data and dataset
     train_data, eval_data = blending_datasets(
@@ -229,9 +246,24 @@ if __name__ == "__main__":
     )
     parser.add_argument("--tokenizer_chat_template", type=str, default=None)
     parser.add_argument("--train_split", type=str, default="train", help="train split of the HF dataset")
-    parser.add_argument("--eval_split", type=str, default="test", help="test split of the dataset")
     parser.add_argument("--max_samples", type=int, default=1e8, help="Max number of samples")
     parser.add_argument("--max_len", type=int, default=512)
+    
+    # PPI parameters
+    parser.add_argument("--percent_train", type=float, default=0.7)
+    parser.add_argument("--percent_val", type=float, default=0.15)
+    parser.add_argument("--percent_test", type=float, default=0.15)
+    
+    parser.add_argument("--target_dataset", type=str, default=None)
+    parser.add_argument("--target_split", type=str, default=None)
+    parser.add_argument("--percent_gold_label", type=float)
+    parser.add_argument("--weak_label_model", type=str, default=None)
+    
+    # PPI training type: 0: all weak labels, 1: small gold labels, 2: all gold labels, 3: small gold labels + weak labels, 4: DR
+    parser.add_argument("--ppi_train_type", type=int, choices=[0, 1, 2, 3, 4], required=True)
+    parser.add_argument("--lambda", type=float)
+    
+    parser.add_argument("--debug", action="store_true", default=False)
 
     # wandb parameters
     parser.add_argument("--use_wandb", type=str, default=None)
@@ -274,5 +306,7 @@ if __name__ == "__main__":
 
         # Patch hub to download models from modelscope to speed up.
         patch_hub()
+        
+    assert args.percent_train + args.percent_val + args.percent_test == 1
 
     train(args)

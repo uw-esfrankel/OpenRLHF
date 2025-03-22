@@ -1,4 +1,5 @@
 import os
+import random
 
 from datasets import interleave_datasets, load_dataset, load_from_disk
 from transformers import AutoTokenizer
@@ -30,6 +31,98 @@ def get_strategy(args):
         args=args,
     )
     return strategy
+
+
+def create_raw_ppi_datasets(
+    dataset,
+    percent_train,
+    percent_val,
+    percent_test,
+    train_split,
+    target_dataset=None,
+    target_split=None,
+    percent_gold_label=None,
+    weak_label_model=None,
+    strategy=None,
+    seed=42,
+    debug=False,
+):
+    dataset = load_dataset(dataset, split=train_split).shuffle(seed=seed)
+    # "transfer learning" setting
+    if target_dataset:
+        target_dataset = load_dataset(target_dataset, split=target_split).shuffle(seed=seed)
+        
+    # "within domain" setting
+    else: 
+        weak_label_column = f"{weak_label_model.lower().replace('-', '_')}_agreement"
+        cols_to_drop = [col for col in dataset.column_names if col not in ["prompt", "chosen", "rejected", weak_label_column]]
+        dataset = dataset.remove_columns(cols_to_drop)
+        
+        # Split dataset into train, val, and test
+        train_end_idx = int(len(dataset) * percent_train)
+        val_end_idx = train_end_idx + int(len(dataset) * percent_val)
+        
+        train_dataset = dataset.select(range(train_end_idx))
+        val_dataset = dataset.select(range(train_end_idx, val_end_idx))
+        test_dataset = dataset.select(range(val_end_idx, len(dataset)))
+        
+        # remove weak_label_column from val_dataset and test_dataset
+        val_dataset = val_dataset.remove_columns([weak_label_column])
+        test_dataset = test_dataset.remove_columns([weak_label_column])
+        
+        if strategy.is_rank_0():
+            strategy.print(f"Dataset splits: train[0:{train_end_idx}], val[{train_end_idx}:{val_end_idx}], test[{val_end_idx}:]")
+            
+        # remove the rows where the weak_label_column is null
+        original_train_dataset_len = len(train_dataset)
+        train_dataset = train_dataset.filter(lambda x: x[weak_label_column] is not None)
+        print(f"Removed {original_train_dataset_len - len(train_dataset)}/{original_train_dataset_len} rows where {weak_label_column} is null")
+            
+        # randomly select percent_gold_label indices from train_dataset
+        gold_label_indices_train = random.sample(range(len(train_dataset)), int(len(train_dataset) * percent_gold_label))
+        non_gold_label_indices_train = [i for i in range(len(train_dataset)) if i not in gold_label_indices_train]
+        
+        # create two new columns in train_dataset: new_chosen and new_rejected
+        # if the index is in gold_label_indices, set new_chosen and new_rejected to chosen and rejected
+        # otherwise, if the value in the weak_label_column is 1, set new_chosen and new_rejected to chosen and rejected
+        # otherwise, set new_chosen and new_rejected to rejected and chosen
+        train_dataset = train_dataset.map(lambda x, idx: {
+            "new_chosen": x["chosen"] if idx in gold_label_indices_train else x["chosen"] if x[weak_label_column] == 1 else x["rejected"],
+            "new_rejected": x["rejected"] if idx in gold_label_indices_train else x["rejected"] if x[weak_label_column] == 1 else x["chosen"],
+            "is_gold_label": 1 if idx in gold_label_indices_train else 0
+        }, with_indices=True)
+        
+        if debug:
+            # assert that new_chosen and new_rejected are the same length as chosen and rejected
+            assert len(train_dataset["new_chosen"]) == len(train_dataset["chosen"])
+            assert len(train_dataset["new_rejected"]) == len(train_dataset["rejected"])
+            
+            # assert that new_chosen and new_rejected are the same as chosen and rejected on the gold_label_indices
+            for idx in gold_label_indices_train:
+                assert train_dataset[idx]["new_chosen"] == train_dataset[idx]["chosen"]
+                assert train_dataset[idx]["new_rejected"] == train_dataset[idx]["rejected"]
+                assert train_dataset[idx]["is_gold_label"] == 1
+                
+            for idx in non_gold_label_indices_train:
+                # assert that new_chosen and new_rejected are different from chosen and rejected on the non-gold_label_indices where the weak_label_column is 0
+                if train_dataset[idx][weak_label_column] == 0:
+                    assert train_dataset[idx]["new_chosen"] != train_dataset[idx]["chosen"]
+                    assert train_dataset[idx]["new_rejected"] != train_dataset[idx]["rejected"]
+                # assert that new_chosen and new_rejected are different from chosen and rejected on the non-gold_label_indices where the weak_label_column is 1
+                else:
+                    assert train_dataset[idx]["new_chosen"] != train_dataset[idx]["rejected"]
+                    assert train_dataset[idx]["new_rejected"] != train_dataset[idx]["chosen"]
+                    
+                assert train_dataset[idx]["is_gold_label"] == 0
+        # remove chosen and rejected columns
+        train_dataset = train_dataset.remove_columns(["chosen", "rejected", weak_label_column])
+        # set new_chosen and new_rejected as chosen and rejected
+        train_dataset = train_dataset.rename_column("new_chosen", "chosen")
+        train_dataset = train_dataset.rename_column("new_rejected", "rejected")
+        
+        breakpoint()
+        
+    return train_dataset, val_dataset, test_dataset
 
 
 def blending_datasets(
