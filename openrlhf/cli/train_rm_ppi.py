@@ -5,10 +5,10 @@ from datetime import datetime
 
 from transformers.trainer import get_scheduler
 
-from openrlhf.datasets import RewardDataset
+from openrlhf.datasets import PPIRewardDataset
 from openrlhf.models import get_llm_for_sequence_regression
-from openrlhf.trainer import RewardModelTrainer
-from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer, create_raw_ppi_datasets
+from openrlhf.trainer import PPIRewardModelTrainer
+from openrlhf.utils import get_strategy, get_tokenizer, create_raw_ppi_datasets
 
 
 def train(args):
@@ -42,46 +42,62 @@ def train(args):
     # configure optimizer
     optim = strategy.create_optimizer(model, lr=args.learning_rate, betas=args.adam_betas, weight_decay=args.l2)
     
-    train_dataset, eval_dataset = create_raw_ppi_datasets(
+    if strategy.is_rank_0():
+        strategy.print("*" * 100)
+    
+    train_dataset, val_dataset, test_dataset = create_raw_ppi_datasets(
         dataset=args.dataset,
         percent_train=args.percent_train,
         percent_val=args.percent_val,
-        percent_test=args.percent_test,
         train_split=args.train_split,
         target_dataset=args.target_dataset,
         target_split=args.target_split,
         percent_gold_label=args.percent_gold_label,
-        weak_label_model=args.weak_label_model,
+        pseudo_label_model=args.pseudo_label_model,
         strategy=strategy,
         seed=args.seed,
         debug=args.debug
     )
     
-    breakpoint()
-
-    # prepare for data and dataset
-    train_data, eval_data = blending_datasets(
-        args.dataset,
-        args.dataset_probs,
+    if strategy.is_rank_0():
+        strategy.print("*" * 100)
+        strategy.print(f"PPI training type: {args.ppi_train_type}.")
+    orig_train_dataset_len = len(train_dataset)
+    
+    assert abs(len(train_dataset.filter(lambda x: x["gt_agreement"] == 1)) / orig_train_dataset_len - args.percent_gold_label) < 0.02
+    
+    if args.ppi_train_type in [0, 3, 4, 5]:
+        # no need to filter anything
+        strategy.print("No filtering needed.")
+        strategy.print(f"Training on {len(train_dataset)}/{orig_train_dataset_len} samples.")
+    # training on only the gold labels!
+    else:
+        assert args.ppi_train_type in [1, 2]
+        strategy.print("Training only on the gold labels.")
+        # filter only where we are "allowed" to train on the gold labels
+        train_dataset = train_dataset.filter(lambda x: x["gt_agreement"] == 1)
+        # this should be approximately the same as the percent_gold_label
+        strategy.print(f"Training on {len(train_dataset)}/{orig_train_dataset_len} samples.")
+        
+    train_dataset = PPIRewardDataset(
+        train_dataset,
+        tokenizer,
+        args.max_len,
         strategy,
-        args.seed,
-        max_count=args.max_samples,
-        stopping_strategy="all_exhausted",
-        train_split=args.train_split,
-        eval_split=args.eval_split,
+        input_template=args.input_template,
+        multiple_of=args.ring_attn_size,
+        debug=args.debug,
     )
-    train_data = train_data.select(range(min(args.max_samples, len(train_data))))
-    eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
-    train_dataset = RewardDataset(
-        train_data,
+    val_dataset = PPIRewardDataset(
+        val_dataset,
         tokenizer,
         args.max_len,
         strategy,
         input_template=args.input_template,
         multiple_of=args.ring_attn_size,
     )
-    eval_dataset = RewardDataset(
-        eval_data,
+    test_dataset = PPIRewardDataset(
+        test_dataset,
         tokenizer,
         args.max_len,
         strategy,
@@ -96,14 +112,23 @@ def train(args):
         True,
         train_dataset.packing_collate_fn if args.packing_samples else train_dataset.collate_fn,
     )
-    eval_dataloader = strategy.setup_dataloader(
-        eval_dataset,
+    val_dataloader = strategy.setup_dataloader(
+        val_dataset,
         args.micro_train_batch_size,
         True,
         False,
-        eval_dataset.packing_collate_fn if args.packing_samples else eval_dataset.collate_fn,
+        val_dataset.packing_collate_fn if args.packing_samples else val_dataset.collate_fn,
     )
-
+    test_dataloader = strategy.setup_dataloader(
+        test_dataset,
+        args.micro_train_batch_size,
+        True,
+        False,
+        test_dataset.packing_collate_fn if args.packing_samples else test_dataset.collate_fn,
+    )
+    
+    breakpoint()
+    
     # scheduler
     num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
     max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
@@ -136,13 +161,16 @@ def train(args):
 
     # batch_size here is micro_batch_size * 2
     # we use merged chosen + rejected response forward
-    trainer = RewardModelTrainer(
+    trainer = PPIRewardModelTrainer(
         model=model,
         strategy=strategy,
         optim=optim,
         tokenizer=tokenizer,
         train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader,
+        val_dataloader=val_dataloader,
+        test_dataloader=test_dataloader,
+        ppi_train_type=args.ppi_train_type,
+        lbda=args.lbda,
         scheduler=scheduler,
         max_norm=args.max_norm,
         max_epochs=args.max_epochs,
@@ -257,11 +285,18 @@ if __name__ == "__main__":
     parser.add_argument("--target_dataset", type=str, default=None)
     parser.add_argument("--target_split", type=str, default=None)
     parser.add_argument("--percent_gold_label", type=float)
-    parser.add_argument("--weak_label_model", type=str, default=None)
+    parser.add_argument("--pseudo_label_model", type=str, default=None)
     
-    # PPI training type: 0: all weak labels, 1: small gold labels, 2: all gold labels, 3: small gold labels + weak labels, 4: DR
-    parser.add_argument("--ppi_train_type", type=int, choices=[0, 1, 2, 3, 4], required=True)
-    parser.add_argument("--lambda", type=float)
+    # Different PPI training types
+    # 0: training only on the pseudo labels
+    # 1: training only on the gold labels
+    # 2: training only on the gold labels for same number of gradient steps as training on the pseudo labels
+    # 3: training on both the pseudo and gold labels
+    # 4: training on the pseudo labels and gold labels with DRPA, switching from training on only the pseudo labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
+    # 5: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps
+    # 6: (time permitting) training only on the high-confidence pseudo labels + gold labels
+    parser.add_argument("--ppi_train_type", type=int, choices=[0, 1, 2, 3, 4, 5, 6], required=True)
+    parser.add_argument("--lbda", type=float)
     
     parser.add_argument("--debug", action="store_true", default=False)
 
