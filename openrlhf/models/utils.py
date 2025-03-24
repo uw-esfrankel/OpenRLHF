@@ -19,7 +19,7 @@ def compute_approx_kl(
         log_probs_base: Log probabilities of the base distribution.
         action_mask: Mask for actions.
     """
-    
+
     if kl_estimator == "k1":
         log_ratio = log_probs.float() - log_probs_base.float()
         if action_mask is not None:
@@ -34,8 +34,8 @@ def compute_approx_kl(
         log_ratio = log_probs.float() - log_probs_base.float()
         if action_mask is not None:
             log_ratio = log_ratio * action_mask
-        log_ratio = log_ratio ** 2 / 2.0
-        
+        log_ratio = log_ratio**2 / 2.0
+
     # The k3 estimator is the non negative kl approximation in
     # http://joschu.net/blog/kl-approx.html
     if kl_estimator == "k3":
@@ -88,14 +88,33 @@ def compute_reward(
     return reward
 
 
-def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def _logsumexp_by_chunk(logits: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
+    seq_len = logits.shape[0]
+    logsumexp_values = torch.zeros((seq_len), device=logits.device, dtype=logits.dtype)
+    for s_idx in range(0, seq_len, chunk_size):
+        end_idx = min(s_idx + chunk_size, seq_len)
+        logsumexp_values[s_idx:end_idx] = torch.logsumexp(logits[s_idx:end_idx], dim=-1)
+
+    return logsumexp_values
+
+
+def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    if temperature != 1.0:
+        logits.div_(temperature)
     # https://github.com/OpenRLHF/OpenRLHF/pull/718#issuecomment-2641081881
     if logits.dtype in [torch.float32, torch.float64]:
-        logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-        logsumexp_values = torch.stack(
-            [torch.logsumexp(l, dim=-1) for l in logits]  # loop to reduce peak mem consumption
-        )
-        log_probs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+        batch_dim = logits.shape[:-1]
+        last_dim = logits.shape[-1]
+        try:
+            from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
+
+            output = cross_entropy_loss(logits.reshape(-1, last_dim), labels.reshape(-1))
+            log_probs_labels = -output[0].view(*batch_dim)
+        except ImportError:
+            logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+            logsumexp_values = _logsumexp_by_chunk(logits.reshape(-1, last_dim))
+            logsumexp_values = logsumexp_values.view(*batch_dim)
+            log_probs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     else:
         log_probs_labels = []
         for row_logits, row_labels in zip(logits, labels):  # loop to reduce peak mem consumption

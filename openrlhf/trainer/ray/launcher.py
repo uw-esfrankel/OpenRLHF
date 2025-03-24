@@ -1,11 +1,10 @@
 import logging
 import os
 import socket
-from typing import Callable, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Type
 
 import ray
 import torch
-import torch.distributed as dist
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
@@ -60,6 +59,38 @@ class BasePPORole(DistributedTorchRayActor):
     def init_model_from_pretrained(self, *args, **kwargs):
         raise NotImplementedError()
 
+    def forward_batch(
+        self,
+        **kwargs,
+    ) -> List[Any]:
+        """Process input data by calling forward function for each item in the lists.
+
+        Args:
+            **kwargs: Input parameters in list format. Each parameter should be a list with same length.
+                     The first parameter's length determines the number of forward calls.
+
+        Returns:
+            List[Any]: List of results from forward function
+        """
+        # Get the first parameter to determine list length
+        first_param = next(iter(kwargs.values()))
+        list_length = len(first_param)
+
+        # Verify all parameters have same length
+        for param_name, param_value in kwargs.items():
+            if len(param_value) != list_length:
+                raise ValueError(f"Parameter {param_name} has length {len(param_value)}, expected {list_length}")
+
+        results = []
+        for i in range(list_length):
+            # Create kwargs for single item
+            sample_kwargs = {param_name: param_value[i] for param_name, param_value in kwargs.items()}
+
+            result = self.forward(**sample_kwargs)
+            results.append(result)
+
+        return results
+
 
 @ray.remote(num_gpus=1)
 class ReferenceModelRayActor(BasePPORole):
@@ -72,6 +103,8 @@ class ReferenceModelRayActor(BasePPORole):
             load_in_4bit=strategy.args.load_in_4bit,
             ds_config=strategy.get_ds_eval_config(offload=strategy.args.ref_reward_offload),
             packing_samples=strategy.args.packing_samples,
+            temperature=strategy.args.temperature,
+            use_liger_kernel=strategy.args.use_liger_kernel,
         )
         strategy.print(model)
 
@@ -104,6 +137,7 @@ class ReferenceModelRayActor(BasePPORole):
         return log_probs.to("cpu")
 
     def empty_cache(self) -> None:
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
 
@@ -133,14 +167,25 @@ class RewardModelRayActor(BasePPORole):
         self.model.eval()
 
     def forward(
-        self, sequences: torch.LongTensor, attention_mask: Optional[torch.Tensor] = None, packed_seq_lens=None, pad_sequence=False
+        self,
+        sequences: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        packed_seq_lens=None,
+        pad_sequence=False,
     ) -> torch.Tensor:
         device = torch.cuda.current_device()
         with torch.no_grad():
-            reward = self.model(sequences.to(device), attention_mask.to(device), ring_attn_group=self.strategy.ring_attn_group, pad_sequence=True, packed_seq_lens=packed_seq_lens)
+            reward = self.model(
+                sequences.to(device),
+                attention_mask.to(device),
+                ring_attn_group=self.strategy.ring_attn_group,
+                pad_sequence=True,
+                packed_seq_lens=packed_seq_lens,
+            )
         return reward.to("cpu")
 
     def empty_cache(self) -> None:
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
 
