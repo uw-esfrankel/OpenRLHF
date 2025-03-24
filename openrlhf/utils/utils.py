@@ -70,17 +70,17 @@ def create_raw_ppi_datasets(
         target_dataset = load_dataset(target_dataset, split=target_split).shuffle(seed=seed)
         target_dataset = target_dataset.rename_column(weak_label_column, "pseudo_label_agreement").remove_columns(cols_to_drop)
         
-        train_dataset_gt_label_split_end_idx = int(len(target_dataset) * percent_train)
-        val_dataset_end_idx = train_dataset_gt_label_split_end_idx + int(len(target_dataset) * percent_val)
+        train_dataset_gold_label_split_end_idx = int(len(target_dataset) * percent_train)
+        val_dataset_end_idx = train_dataset_gold_label_split_end_idx + int(len(target_dataset) * percent_val)
         
-        train_dataset_gt_label_split = target_dataset.select(range(train_dataset_gt_label_split_end_idx))
-        val_dataset = target_dataset.select(range(train_dataset_gt_label_split_end_idx, val_dataset_end_idx)).remove_columns(["pseudo_label_agreement"])
+        train_dataset_gold_label_split = target_dataset.select(range(train_dataset_gold_label_split_end_idx))
+        val_dataset = target_dataset.select(range(train_dataset_gold_label_split_end_idx, val_dataset_end_idx)).remove_columns(["pseudo_label_agreement"])
         test_dataset = target_dataset.select(range(val_dataset_end_idx, len(target_dataset))).remove_columns(["pseudo_label_agreement"])
         
-        train_dataset_gt_label_split = train_dataset_gt_label_split.map(lambda x: {"gt_agreement": 1})
-        train_dataset_pseudo_label_split = train_dataset_pseudo_label_split.map(lambda x: {"gt_agreement": -1})
+        train_dataset_gold_label_split = train_dataset_gold_label_split.map(lambda x: {"gold_label_agreement": 1})
+        train_dataset_pseudo_label_split = train_dataset_pseudo_label_split.map(lambda x: {"gold_label_agreement": -1})
         
-        current_gold_ratio = len(train_dataset_gt_label_split) / (len(train_dataset_gt_label_split) + len(train_dataset_pseudo_label_split))
+        current_gold_ratio = len(train_dataset_gold_label_split) / (len(train_dataset_gold_label_split) + len(train_dataset_pseudo_label_split))
         if strategy.is_rank_0():
             strategy.print(f"Current ratio of gold labels: {current_gold_ratio:.4f} (target: {percent_gold_label:.4f})")
             
@@ -88,8 +88,8 @@ def create_raw_ppi_datasets(
         if current_gold_ratio < percent_gold_label:
             # We need to remove weak labels to increase the gold ratio
             # Calculate how many weak samples to keep
-            total_samples_after = len(train_dataset_gt_label_split) / percent_gold_label
-            weak_samples_to_keep = int(total_samples_after - len(train_dataset_gt_label_split))
+            total_samples_after = len(train_dataset_gold_label_split) / percent_gold_label
+            weak_samples_to_keep = int(total_samples_after - len(train_dataset_gold_label_split))
             
             # Ensure we're not trying to keep more than we have
             weak_samples_to_keep = min(weak_samples_to_keep, len(train_dataset_pseudo_label_split))
@@ -101,23 +101,23 @@ def create_raw_ppi_datasets(
         elif current_gold_ratio > percent_gold_label:
             # We need to remove gold labels to decrease the gold ratio
             # Calculate how many gold samples to keep
-            total_samples = len(train_dataset_gt_label_split) + len(train_dataset_pseudo_label_split)
+            total_samples = len(train_dataset_gold_label_split) + len(train_dataset_pseudo_label_split)
             gold_samples_to_keep = int(total_samples * percent_gold_label)
             
             # Ensure we're not trying to keep more than we have
-            gold_samples_to_keep = min(gold_samples_to_keep, len(train_dataset_gt_label_split))
+            gold_samples_to_keep = min(gold_samples_to_keep, len(train_dataset_gold_label_split))
             
             if strategy.is_rank_0():
-                strategy.print(f"Keeping {gold_samples_to_keep} samples from train_dataset_gt_label_split (removing {len(train_dataset_gt_label_split) - gold_samples_to_keep})")
-            train_dataset_gt_label_split = train_dataset_gt_label_split.select(range(gold_samples_to_keep))
+                strategy.print(f"Keeping {gold_samples_to_keep} samples from train_dataset_gold_label_split (removing {len(train_dataset_gold_label_split) - gold_samples_to_keep})")
+            train_dataset_gold_label_split = train_dataset_gold_label_split.select(range(gold_samples_to_keep))
             
         # Recalculate and verify the new ratio
-        new_total = len(train_dataset_gt_label_split) + len(train_dataset_pseudo_label_split)
-        new_gold_ratio = len(train_dataset_gt_label_split) / new_total
+        new_total = len(train_dataset_gold_label_split) + len(train_dataset_pseudo_label_split)
+        new_gold_ratio = len(train_dataset_gold_label_split) / new_total
         if strategy.is_rank_0():
             strategy.print(f"New ratio of gold labels: {new_gold_ratio:.4f} (target: {percent_gold_label:.4f})")
             
-        train_dataset = concatenate_datasets([train_dataset_gt_label_split, train_dataset_pseudo_label_split]).shuffle(seed=seed)
+        train_dataset = concatenate_datasets([train_dataset_gold_label_split, train_dataset_pseudo_label_split]).shuffle(seed=seed)
                         
     # "within domain" setting
     else: 
@@ -147,7 +147,7 @@ def create_raw_ppi_datasets(
         
         # -1 means we don't "know" the gold label in this case
         train_dataset = train_dataset.map(lambda x, idx: {
-            "gt_agreement": 1 if idx in gold_label_indices_train else -1
+            "gold_label_agreement": 1 if idx in gold_label_indices_train else -1
         }, with_indices=True)
                 
     if debug:
@@ -155,7 +155,7 @@ def create_raw_ppi_datasets(
             # only the train dataset has is_pseudo_label
             if i == 0:
                 assert dataset.filter(lambda x: x['pseudo_label_agreement'] is None).num_rows == 0
-                assert dataset.filter(lambda x: x['gt_agreement'] is None).num_rows == 0
+                assert dataset.filter(lambda x: x['gold_label_agreement'] is None).num_rows == 0
                 
             assert dataset.filter(lambda x: x['prompt'] is None).num_rows == 0
             assert dataset.filter(lambda x: x['chosen'] is None).num_rows == 0

@@ -40,7 +40,9 @@ class PPIRewardModelTrainer(ABC):
         tokenizer,
         max_norm=0.5,
         max_epochs: int = 2,
+        max_steps: int = -1,
         loss="sigmoid",
+        debug=False,
     ) -> None:
         super().__init__()
         self.strategy = strategy
@@ -48,6 +50,7 @@ class PPIRewardModelTrainer(ABC):
         self.max_norm = max_norm
         self.ppi_train_type = ppi_train_type
         self.lbda = lbda
+        self.max_steps = max_steps
         self.model = model
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
@@ -56,7 +59,7 @@ class PPIRewardModelTrainer(ABC):
         self.optimizer = optim
         self.tokenizer = tokenizer
         self.args = strategy.args
-
+        self.debug = debug
         if loss == "sigmoid":
             self.loss_fn = PairWiseLoss()
             self.strategy.print("LogSigmoid Loss")
@@ -119,13 +122,14 @@ class PPIRewardModelTrainer(ABC):
         if self.strategy.is_rank_0():
             self.strategy.print(f"Taking a total of {total_steps} steps")
             
-        if self.ppi_train_type in [3, 4]:
+        if self.ppi_train_type in [4, 5]:
             # get the number of steps to switch from training on only the pseudo labels to training on both the pseudo and gold labels
             switch_steps = int(total_steps * self.lbda)
             self.strategy.print(f"Switching from training on only the pseudo labels to training on both the pseudo and gold labels after {switch_steps} steps")
 
         # Restore step and start_epoch
         step = consumed_samples // args.train_batch_size * self.strategy.accumulated_gradient + 1
+        global_step = step // self.strategy.accumulated_gradient
         start_epoch = consumed_samples // args.train_batch_size // num_update_steps_per_epoch
         consumed_samples = consumed_samples % (num_update_steps_per_epoch * args.train_batch_size)
 
@@ -148,7 +152,7 @@ class PPIRewardModelTrainer(ABC):
             self.model.train()
             for data in self.train_dataloader:
                 if not self.packing_samples:
-                    chosen_ids, c_mask, reject_ids, r_mask, is_pseudo_label, margin = data
+                    chosen_ids, c_mask, reject_ids, r_mask, pseudo_label_agreement, gold_label_agreement, margin = data
                     chosen_ids = chosen_ids.squeeze(1).to(torch.cuda.current_device())
                     c_mask = c_mask.squeeze(1).to(torch.cuda.current_device())
                     reject_ids = reject_ids.squeeze(1).to(torch.cuda.current_device())
@@ -158,7 +162,7 @@ class PPIRewardModelTrainer(ABC):
                         self.model, chosen_ids, c_mask, reject_ids, r_mask
                     )
                 else:
-                    packed_input_ids, packed_attention_masks, packed_seq_lens, is_pseudo_label, margin = data
+                    packed_input_ids, packed_attention_masks, packed_seq_lens, pseudo_label_agreement, gold_label_agreement, margin = data
                     packed_input_ids, packed_attention_masks = packed_input_ids.to(
                         torch.cuda.current_device()
                     ), packed_attention_masks.to(torch.cuda.current_device())
@@ -178,23 +182,131 @@ class PPIRewardModelTrainer(ABC):
                     chosen_reward = chosen_reward.float()
                     reject_reward = reject_reward.float()
                     
-
-                if self.ppi_train_type in [0, 1, 2]:
-                    # only use pseudo labels
+                # Different PPI training types
+                # 0: training only on the pseudo labels
+                # 1: training only on the gold labels
+                # 2: training only on the gold labels for same number of gradient steps as training on the pseudo labels
+                # 3: training on both the pseudo and gold labels
+                # 4: training on the pseudo labels and gold labels with DRPA, switching from training on only the pseudo labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
+                # 5: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps
+                # 6: (time permitting) training only on the high-confidence pseudo labels + gold labels
+                
+                assert margin is None, "Margin should be None for PPI training type 0"
+                
+                # 0: training only on the pseudo labels
+                if self.ppi_train_type == 0:
+                    preference_loss = self.compute_pseudo_label_loss(chosen_reward, reject_reward, pseudo_label_agreement)                
+                # 1: training only on the gold labels
+                # 2: training only on the gold labels for same number of gradient steps as training on the pseudo labels
+                elif self.ppi_train_type in [1, 2]:
+                    # chosen_reward and reject_reward are already the gold labels
+                    # 1 has reduced dataset size, so we don't need to do anything
+                    # 2 just has more gradient steps, so we don't need to do anything
+                    if self.debug:
+                        assert torch.all(gold_label_agreement == 1), "gold_label_agreement should be 1"
                     preference_loss = self.loss_fn(chosen_reward, reject_reward, margin)
+                # 3: training on both the pseudo and gold labels
                 elif self.ppi_train_type == 3:
-                    # train with DRPA
-                    alpha_t = 0
+                    # when gold_label_agreement is 1, we use those gold labels; when gold_label_agreement is -1, we use the pseudo labels
+                    # same_mask is the indices where the gold labels are 1 OR the pseudo labels are 1
+                    same_mask = torch.logical_or(gold_label_agreement == 1, pseudo_label_agreement == 1)
+                    diff_mask = ~same_mask
+                    
+                    # Initialize combined tensors for chosen and reject rewards
+                    final_chosen = torch.empty_like(chosen_reward)
+                    final_reject = torch.empty_like(reject_reward)
+                    
+                    # Assign values based on masks
+                    final_chosen[same_mask] = chosen_reward[same_mask]
+                    final_chosen[diff_mask] = reject_reward[diff_mask]
+                    
+                    final_reject[same_mask] = reject_reward[same_mask]
+                    final_reject[diff_mask] = chosen_reward[diff_mask]
+                    
+                    # final_chosen and final_reject should be non-zero and have different values
+                    if self.debug:
+                        assert torch.all(final_chosen != 0), "final_chosen should be non-zero"
+                        assert torch.all(final_reject != 0), "final_reject should be non-zero"
+                        if torch.all(chosen_reward != reject_reward):
+                            assert torch.all(final_chosen != final_reject), "final_chosen and final_reject should have different values"
+                    
+                    preference_loss = self.loss_fn(final_chosen, final_reject)
+                    
+                    if self.debug:
+                        # Identify samples with gold labels
+                        gold_label_samples = gold_label_agreement == 1
+                        # Use pseudo-labels for the rest
+                        pseudo_label_samples = ~gold_label_samples
+                        
+                        final_chosen2 = torch.empty_like(chosen_reward)
+                        final_reject2 = torch.empty_like(reject_reward)
+
+                        # For gold samples, use directly
+                        final_chosen2[gold_label_samples] = chosen_reward[gold_label_samples]
+                        final_reject2[gold_label_samples] = reject_reward[gold_label_samples]
+                        
+                        # For pseudo samples, apply pseudo-label logic
+                        pseudo_same = pseudo_label_agreement[pseudo_label_samples] == 1
+                        pseudo_diff = ~pseudo_same
+                        
+                        pseudo_chosen = torch.empty_like(final_chosen2[pseudo_label_samples])
+                        pseudo_reject = torch.empty_like(final_chosen2[pseudo_label_samples])
+                        
+                        pseudo_chosen[pseudo_same] = chosen_reward[pseudo_label_samples][pseudo_same]
+                        pseudo_chosen[pseudo_diff] = reject_reward[pseudo_label_samples][pseudo_diff]
+                        
+                        pseudo_reject[pseudo_same] = reject_reward[pseudo_label_samples][pseudo_same]
+                        pseudo_reject[pseudo_diff] = chosen_reward[pseudo_label_samples][pseudo_diff]
+                        
+                        final_chosen2[pseudo_label_samples] = pseudo_chosen
+                        final_reject2[pseudo_label_samples] = pseudo_reject
+                        
+                        preference_loss2 = self.loss_fn(final_chosen2, final_reject2)
+                        
+                        assert preference_loss2.item() == preference_loss.item(), "preference_loss2 should be the same as preference_loss"
+                        assert torch.all(final_chosen2 == final_chosen), "final_chosen2 should be the same as final_chosen"
+                        assert torch.all(final_reject2 == final_reject), "final_reject2 should be the same as final_reject"
+                # 4: training on the pseudo labels and gold labels with DRPA, switching from training on only the pseudo labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
                 elif self.ppi_train_type == 4:
-                    # train with DRPA, switching from training on only the pseudo labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
+                    # if we are before the switch step, we only use the pseudo labels
+                    if global_step < switch_steps:
+                        preference_loss = self.compute_pseudo_label_loss(chosen_reward, reject_reward, pseudo_label_agreement)
+                    else:                    
+                        # has already taken the mean, this is over all available
+                        total_pseudo_label_loss = self.compute_pseudo_label_loss(chosen_reward, reject_reward, pseudo_label_agreement)
+                        
+                        # when gold_label_agreement is 1, we can "see" the gold labels
+                        gold_label_indices = gold_label_agreement == 1
+                        # get the gold label loss on only the gold labels
+                        small_gold_label_loss = self.loss_fn(chosen_reward[gold_label_indices], reject_reward[gold_label_indices])
+                        # get the pseudo label loss on the same indices
+                        small_pseudo_label_loss = self.compute_pseudo_label_loss(chosen_reward[gold_label_indices], reject_reward[gold_label_indices], pseudo_label_agreement[gold_label_indices])
+                        
+                        # doubly robust preference loss
+                        preference_loss = total_pseudo_label_loss - small_pseudo_label_loss + small_gold_label_loss
+                        
+                # 5: training on the pseudo labels and all gold labels, where we initially train on only the pseudo labels, then switch to all the gold labels after fraction lbda of total training steps
+                elif self.ppi_train_type == 5:
+                    if global_step < switch_steps:
+                        preference_loss = self.compute_pseudo_label_loss(chosen_reward, reject_reward, pseudo_label_agreement)
+                    else:
+                        preference_loss = self.loss_fn(chosen_reward, reject_reward)
+                # 6: training on the pseudo labels and limited set of gold labels, where we initially train on only the pseudo labels, then switch to the small set of gold labels after fraction lbda of total training steps
+                elif self.ppi_train_type == 6:
+                    if global_step < switch_steps:
+                        preference_loss = self.compute_pseudo_label_loss(chosen_reward, reject_reward, pseudo_label_agreement)
+                    else:
+                        gold_label_indices = gold_label_agreement == 1
+                        preference_loss = self.loss_fn(chosen_reward[gold_label_indices], reject_reward[gold_label_indices])
+                # 7: (time permitting) training only on the high-confidence pseudo labels + gold labels
+                elif self.ppi_train_type == 7:
+                    # TODO: implement this
                     pass
                     
                 # mixtral
                 if not self.aux_loss:
                     aux_loss = 0
-                    
-                breakpoint()
-
+                                        
                 loss = preference_loss + aux_loss * self.args.aux_loss_coef
                 self.strategy.backward(loss, self.model, self.optimizer)
                 self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
@@ -229,6 +341,8 @@ class PPIRewardModelTrainer(ABC):
                     self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict, client_states)
 
                 step += 1
+                if self.max_steps > 0 and global_step >= self.max_steps:
+                    break
             epoch_bar.update()
 
         if self._wandb is not None and self.strategy.is_rank_0():
@@ -251,17 +365,21 @@ class PPIRewardModelTrainer(ABC):
         # eval
         if global_step % args.eval_steps == 0:
             # do eval when len(dataloader) > 0, avoid zero division in eval.
-            if len(self.eval_dataloader) > 0:
-                self.evaluate(self.eval_dataloader, global_step)
+            if len(self.val_dataloader) > 0:
+                self.evaluate(self.val_dataloader, global_step)
+            if len(self.test_dataloader) > 0:
+                self.evaluate(self.test_dataloader, global_step, is_val=False)
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity on whole dev dataset as metric
         if global_step % args.save_steps == 0:
             tag = f"global_step{global_step}"
-            self.strategy.save_ckpt(
-                self.model, args.ckpt_path, tag, args.max_ckpt_num, args.max_ckpt_mem, client_states
-            )
+            self.strategy.print("Save value_head_prefix in config")
+            unwrap_model = self.strategy._unwrap_model(self.model)
+            unwrap_model.config.value_head_prefix = args.value_head_prefix
+            
+            self.strategy.save_model(self.model, self.tokenizer, args.save_path, tag)
 
-    def evaluate(self, eval_dataloader, steps=0):
+    def evaluate(self, eval_dataloader, steps=0, is_val=False):
         step_bar = tqdm(
             range(eval_dataloader.__len__()),
             desc="Eval stage of steps %d" % steps,
@@ -274,7 +392,7 @@ class PPIRewardModelTrainer(ABC):
             loss_sum = 0
             for data in eval_dataloader:
                 if not self.packing_samples:
-                    chosen_ids, c_mask, reject_ids, r_mask, margin = data
+                    chosen_ids, c_mask, reject_ids, r_mask, _, _, margin = data
                     chosen_ids = chosen_ids.squeeze(1).to(torch.cuda.current_device())
                     c_mask = c_mask.squeeze(1).to(torch.cuda.current_device())
                     reject_ids = reject_ids.squeeze(1).to(torch.cuda.current_device())
@@ -284,7 +402,7 @@ class PPIRewardModelTrainer(ABC):
                         self.model, chosen_ids, c_mask, reject_ids, r_mask
                     )
                 else:
-                    packed_input_ids, packed_attention_masks, packed_seq_lens, margin = data
+                    packed_input_ids, packed_attention_masks, packed_seq_lens, _, _, margin = data
                     packed_input_ids, packed_attention_masks = packed_input_ids.to(
                         torch.cuda.current_device()
                     ), packed_attention_masks.to(torch.cuda.current_device())
@@ -319,6 +437,11 @@ class PPIRewardModelTrainer(ABC):
             unwrap_model.config.mean = reward_mean.item()
             unwrap_model.config.std = reward_std.item()
 
+            if is_val:
+                self.strategy.print("Saving val metrics")
+            else:
+                self.strategy.print("Saving test metrics")
+
             bar_dict = {
                 "eval_loss": loss_mean,
                 "acc_mean": acc_mean,
@@ -334,7 +457,7 @@ class PPIRewardModelTrainer(ABC):
 
             if self.strategy.is_rank_0():
                 if self._wandb is not None:
-                    logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": steps}.items()}
+                    logs = {f"{'val' if is_val else 'test'}/%s" % k: v for k, v in {**logs, "global_step": steps}.items()}
                     self._wandb.log(logs)
                 elif self._tensorboard is not None:
                     for k, v in logs.items():
@@ -400,3 +523,38 @@ class PPIRewardModelTrainer(ABC):
         aux_loss = output.aux_loss if "aux_loss" in output else []
 
         return chosen_rewards, rejected_rewards, aux_loss
+
+    def compute_pseudo_label_loss(self, chosen_reward, reject_reward, pseudo_label_agreement):
+        """Compute loss using only pseudo labels by swapping rewards based on agreement.
+        
+        Args:
+            chosen_reward (torch.Tensor): Rewards for chosen responses
+            reject_reward (torch.Tensor): Rewards for rejected responses 
+            pseudo_label_agreement (torch.Tensor): Binary tensor indicating agreement (1) or disagreement (0)
+            
+        Returns:
+            torch.Tensor: Computed loss using pseudo labels
+        """
+        # Create boolean masks for same/different predictions
+        same_mask = pseudo_label_agreement == 1
+        diff_mask = ~same_mask
+
+        # Initialize combined tensors for chosen and reject rewards
+        final_chosen = torch.empty_like(chosen_reward)
+        final_reject = torch.empty_like(reject_reward)
+
+        # Assign values based on masks
+        final_chosen[same_mask] = chosen_reward[same_mask]
+        final_chosen[diff_mask] = reject_reward[diff_mask]
+
+        final_reject[same_mask] = reject_reward[same_mask]
+        final_reject[diff_mask] = chosen_reward[diff_mask]
+        
+        # final_chosen and final_reject should be non-zero and have different values
+        if self.debug:
+            assert torch.all(final_chosen != 0), "final_chosen should be non-zero"
+            assert torch.all(final_reject != 0), "final_reject should be non-zero"
+            if torch.all(chosen_reward != reject_reward):
+                assert torch.all(final_chosen != final_reject), "final_chosen and final_reject should have different values"
+
+        return self.loss_fn(final_chosen, final_reject)

@@ -64,7 +64,7 @@ def train(args):
         strategy.print(f"PPI training type: {args.ppi_train_type}.")
     orig_train_dataset_len = len(train_dataset)
     
-    assert abs(len(train_dataset.filter(lambda x: x["gt_agreement"] == 1)) / orig_train_dataset_len - args.percent_gold_label) < 0.02
+    assert abs(len(train_dataset.filter(lambda x: x["gold_label_agreement"] == 1)) / orig_train_dataset_len - args.percent_gold_label) < 0.02
     
     if args.ppi_train_type in [0, 3, 4, 5]:
         # no need to filter anything
@@ -75,7 +75,7 @@ def train(args):
         assert args.ppi_train_type in [1, 2]
         strategy.print("Training only on the gold labels.")
         # filter only where we are "allowed" to train on the gold labels
-        train_dataset = train_dataset.filter(lambda x: x["gt_agreement"] == 1)
+        train_dataset = train_dataset.filter(lambda x: x["gold_label_agreement"] == 1)
         # this should be approximately the same as the percent_gold_label
         strategy.print(f"Training on {len(train_dataset)}/{orig_train_dataset_len} samples.")
         
@@ -86,7 +86,6 @@ def train(args):
         strategy,
         input_template=args.input_template,
         multiple_of=args.ring_attn_size,
-        debug=args.debug,
     )
     val_dataset = PPIRewardDataset(
         val_dataset,
@@ -126,12 +125,17 @@ def train(args):
         False,
         test_dataset.packing_collate_fn if args.packing_samples else test_dataset.collate_fn,
     )
-    
-    breakpoint()
-    
     # scheduler
     num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
-    max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
+    if args.ppi_train_type == 2:
+        max_steps = orig_train_dataset_len // args.train_batch_size * args.max_epochs
+        # number of epochs is however many needed to reach force_steps
+        max_epochs = math.ceil(max_steps / num_update_steps_per_epoch)
+    else:
+        max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
+        max_epochs = args.max_epochs
+    strategy.print(f"Training for {max_steps} steps, requires {max_epochs} epochs")
+    breakpoint()
 
     scheduler = get_scheduler(
         "cosine_with_min_lr",
@@ -173,8 +177,10 @@ def train(args):
         lbda=args.lbda,
         scheduler=scheduler,
         max_norm=args.max_norm,
-        max_epochs=args.max_epochs,
+        max_epochs=max_epochs,
+        max_steps=max_steps,
         loss=args.loss,
+        debug=args.debug,
     )
 
     trainer.fit(args, consumed_samples, num_update_steps_per_epoch)
@@ -294,9 +300,11 @@ if __name__ == "__main__":
     # 3: training on both the pseudo and gold labels
     # 4: training on the pseudo labels and gold labels with DRPA, switching from training on only the pseudo labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
     # 5: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps
-    # 6: (time permitting) training only on the high-confidence pseudo labels + gold labels
+    # 6: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps. Small set of gold labels
+    # 7: (time permitting) training only on the high-confidence pseudo labels + gold labels
     parser.add_argument("--ppi_train_type", type=int, choices=[0, 1, 2, 3, 4, 5, 6], required=True)
     parser.add_argument("--lbda", type=float)
+    parser.add_argument("--force_steps", type=int, default=-1)
     
     parser.add_argument("--debug", action="store_true", default=False)
 

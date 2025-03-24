@@ -44,9 +44,9 @@ def preprocess_data_ppi(
     margin = data["margin"] if exist_and_not_none(data, "margin") else 0
     
     pseudo_label_agreement = data["pseudo_label_agreement"] if "pseudo_label_agreement" in data else None
-    gt_agreement = data["gt_agreement"] if "gt_agreement" in data else None
+    gold_label_agreement = data["gold_label_agreement"] if "gold_label_agreement" in data else None
     
-    return prompt, chosen, rejected, pseudo_label_agreement, gt_agreement, margin
+    return prompt, chosen, rejected, pseudo_label_agreement, gold_label_agreement, margin
 
 
 class PPIRewardDataset(Dataset):
@@ -69,7 +69,6 @@ class PPIRewardDataset(Dataset):
         is_dpo=False,
         num_processors=8,
         multiple_of=1,
-        debug=False,
     ) -> None:
         super().__init__()
         self.is_dpo = is_dpo
@@ -104,11 +103,11 @@ class PPIRewardDataset(Dataset):
         self.chosens = processed_dataset["chosen"]
         self.rejects = processed_dataset["reject"]
         self.pseudo_label_agreements = processed_dataset["pseudo_label_agreement"]
-        self.gt_agreements = processed_dataset["gt_agreement"]
+        self.gold_label_agreements = processed_dataset["gold_label_agreement"]
         self.extras = processed_dataset["extra"]
 
     def process_data(self, data):
-        prompt, chosen, reject, pseudo_label_agreement, gt_agreement, margin = preprocess_data_ppi(
+        prompt, chosen, reject, pseudo_label_agreement, gold_label_agreement, margin = preprocess_data_ppi(
             data,
             self.input_template,
             self.prompt_key,
@@ -138,7 +137,7 @@ class PPIRewardDataset(Dataset):
             "chosen": chosen,
             "reject": reject,
             "pseudo_label_agreement": pseudo_label_agreement,
-            "gt_agreement": gt_agreement,
+            "gold_label_agreement": gold_label_agreement,
             "extra": prompt_ids_len if self.is_dpo else margin,
         }
 
@@ -147,7 +146,7 @@ class PPIRewardDataset(Dataset):
         return length
 
     def __getitem__(self, idx):
-        prompt, chosen, reject, pseudo_label_agreement, gt_agreement, extra = self.prompts[idx], self.chosens[idx], self.rejects[idx], self.pseudo_label_agreements[idx], self.gt_agreements[idx], self.extras[idx]
+        prompt, chosen, reject, pseudo_label_agreement, gold_label_agreement, extra = self.prompts[idx], self.chosens[idx], self.rejects[idx], self.pseudo_label_agreements[idx], self.gold_label_agreements[idx], self.extras[idx]
 
         chosen = (prompt + chosen).rstrip("\n")
         if not chosen.endswith(self.tokenizer.eos_token):
@@ -185,7 +184,7 @@ class PPIRewardDataset(Dataset):
             reject_token["input_ids"],
             reject_token["attention_mask"],
             pseudo_label_agreement,
-            gt_agreement,
+            gold_label_agreement,
             extra,
         )
 
@@ -195,15 +194,15 @@ class PPIRewardDataset(Dataset):
         reject_ids = []
         rejects_masks = []
         pseudo_label_agreements = []
-        gt_agreements = []
+        gold_label_agreements = []
         extras = []
-        for chosen_id, chosen_mask, reject_id, rejects_mask, pseudo_label_agreement, gt_agreement, extra in item_list:
+        for chosen_id, chosen_mask, reject_id, rejects_mask, pseudo_label_agreement, gold_label_agreement, extra in item_list:
             chosen_ids.append(chosen_id)
             chosen_masks.append(chosen_mask)
             reject_ids.append(reject_id)
             rejects_masks.append(rejects_mask)
             pseudo_label_agreements.append(pseudo_label_agreement)
-            gt_agreements.append(gt_agreement)
+            gold_label_agreements.append(gold_label_agreement)
             extras.append(extra)
 
         if self.is_dpo:
@@ -214,7 +213,12 @@ class PPIRewardDataset(Dataset):
         chosen_masks = zero_pad_sequences(chosen_masks, side=padding_side)
         reject_ids = zero_pad_sequences(reject_ids, side=padding_side, value=self.tokenizer.pad_token_id)
         rejects_masks = zero_pad_sequences(rejects_masks, side=padding_side)
-        return chosen_ids, chosen_masks, reject_ids, rejects_masks, pseudo_label_agreements, gt_agreements, extras
+        
+        # Convert label agreements to tensors
+        pseudo_label_agreements = torch.tensor(pseudo_label_agreements, dtype=torch.int)
+        gold_label_agreements = torch.tensor(gold_label_agreements, dtype=torch.int)
+        
+        return chosen_ids, chosen_masks, reject_ids, rejects_masks, pseudo_label_agreements, gold_label_agreements, extras
 
     def packing_collate_fn(self, item_list):
         extras = []
@@ -226,9 +230,9 @@ class PPIRewardDataset(Dataset):
         rejected_att_masks = []
         rejected_seq_lens = []
         pseudo_label_agreements = []
-        gt_agreements = []
+        gold_label_agreements = []
         index = 1
-        for chosen_id, chosen_mask, reject_id, rejects_mask, pseudo_label_agreement, gt_agreement, extra in item_list:
+        for chosen_id, chosen_mask, reject_id, rejects_mask, pseudo_label_agreement, gold_label_agreement, extra in item_list:
             chosen_ids.append(chosen_id.flatten())
             chosen_att_masks.append(torch.full_like(chosen_id.flatten(), index))
             chosen_seq_lens.append(len(chosen_id.flatten()))
@@ -238,7 +242,7 @@ class PPIRewardDataset(Dataset):
             rejected_att_masks.append(torch.full_like(reject_id.flatten(), index + len(item_list)))
             rejected_seq_lens.append(len(reject_id.flatten()))
             pseudo_label_agreements.append(pseudo_label_agreement)
-            gt_agreements.append(gt_agreement)
+            gold_label_agreements.append(gold_label_agreement)
             index += 1
 
         packed_input_ids = torch.cat(chosen_ids + rejected_ids, dim=0).unsqueeze(0)
@@ -250,5 +254,9 @@ class PPIRewardDataset(Dataset):
             packed_input_ids = F.pad(packed_input_ids, (0, padding_len), value=self.tokenizer.pad_token_id)
             packed_attention_masks = F.pad(packed_attention_masks, (0, padding_len), value=0)
 
-        return packed_input_ids, packed_attention_masks, packed_seq_lens, pseudo_label_agreements, gt_agreements, extras
+        # Convert label agreements to tensors
+        pseudo_label_agreements = torch.tensor(pseudo_label_agreements, dtype=torch.int)
+        gold_label_agreements = torch.tensor(gold_label_agreements, dtype=torch.int)
+
+        return packed_input_ids, packed_attention_masks, packed_seq_lens, pseudo_label_agreements, gold_label_agreements, extras
 

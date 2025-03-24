@@ -5,13 +5,13 @@ deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
     --eval_steps -1 \
     --train_batch_size 128 \
     --micro_train_batch_size 8 \
-    --pretrain Qwen/Qwen2.5-7B-Instruct \
+    --pretrain Qwen/Qwen2.5-1.5B-Instruct \
     --bf16 \
     --max_epochs 1 \
     --max_len 8192 \
     --zero_stage 1 \
     --learning_rate 9e-6 \
-    --dataset esfrankel17/HelpSteer2_binarized_w_weak_preferences \
+    --dataset esfrankel17/HelpSteer2_binarized_w_weak_preferences_cleaned \
     --train_split goodness_score \
     --apply_chat_template \
     --chosen_key chosen \
@@ -21,5 +21,6 @@ deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
     --gradient_checkpointing \
     --percent_gold_label 0.1 \
     --pseudo_label_model Qwen2.5-7B-Instruct \
-    --ppi_train_type 1 \
+    --ppi_train_type 2 \
+    --lbda 0.2 \
     --debug
