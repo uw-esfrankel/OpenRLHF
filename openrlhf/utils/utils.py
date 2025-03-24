@@ -56,30 +56,36 @@ def create_raw_ppi_datasets(
     
     # "transfer learning" setting
     if target_dataset:
-        if strategy.is_rank_0():
-            strategy.print(f"GT target label dataset: {target_dataset}")
-            
         train_dataset_pseudo_label_split = dataset.remove_columns(cols_to_drop)
+        train_dataset_pseudo_label_split = train_dataset_pseudo_label_split.map(lambda x: {"gold_label_agreement": -1})
         
-        # remove the rows where the weak_label_column is null
+        # remove the rows where the pseudo_label_agreement is null
         original_train_dataset_pseudo_label_split_len = len(train_dataset_pseudo_label_split)
         train_dataset_pseudo_label_split = train_dataset_pseudo_label_split.filter(lambda x: x["pseudo_label_agreement"] is not None)
         if strategy.is_rank_0():
             strategy.print(f"Removed {original_train_dataset_pseudo_label_split_len - len(train_dataset_pseudo_label_split)}/{original_train_dataset_pseudo_label_split_len} rows where {weak_label_column} is null")
         
+        if strategy.is_rank_0():
+            strategy.print(f"GT target label dataset: {target_dataset}")
+        
         target_dataset = load_dataset(target_dataset, split=target_split).shuffle(seed=seed)
         target_dataset = target_dataset.rename_column(weak_label_column, "pseudo_label_agreement").remove_columns(cols_to_drop)
+        # remove the rows where the pseudo_label_agreement is null
+        original_target_dataset_len = len(target_dataset)
+        target_dataset = target_dataset.filter(lambda x: x["pseudo_label_agreement"] is not None)
+        if strategy.is_rank_0():
+            strategy.print(f"Removed {original_target_dataset_len - len(target_dataset)}/{original_target_dataset_len} rows where {weak_label_column} is null")
         
+        # map the gold_label_agreement to 1
+        target_dataset = target_dataset.map(lambda x: {"gold_label_agreement": 1})
+                
         train_dataset_gold_label_split_end_idx = int(len(target_dataset) * percent_train)
         val_dataset_end_idx = train_dataset_gold_label_split_end_idx + int(len(target_dataset) * percent_val)
         
         train_dataset_gold_label_split = target_dataset.select(range(train_dataset_gold_label_split_end_idx))
-        val_dataset = target_dataset.select(range(train_dataset_gold_label_split_end_idx, val_dataset_end_idx)).remove_columns(["pseudo_label_agreement"])
-        test_dataset = target_dataset.select(range(val_dataset_end_idx, len(target_dataset))).remove_columns(["pseudo_label_agreement"])
-        
-        train_dataset_gold_label_split = train_dataset_gold_label_split.map(lambda x: {"gold_label_agreement": 1})
-        train_dataset_pseudo_label_split = train_dataset_pseudo_label_split.map(lambda x: {"gold_label_agreement": -1})
-        
+        val_dataset = target_dataset.select(range(train_dataset_gold_label_split_end_idx, val_dataset_end_idx))
+        test_dataset = target_dataset.select(range(val_dataset_end_idx, len(target_dataset)))
+                
         current_gold_ratio = len(train_dataset_gold_label_split) / (len(train_dataset_gold_label_split) + len(train_dataset_pseudo_label_split))
         if strategy.is_rank_0():
             strategy.print(f"Current ratio of gold labels: {current_gold_ratio:.4f} (target: {percent_gold_label:.4f})")
@@ -117,28 +123,25 @@ def create_raw_ppi_datasets(
         if strategy.is_rank_0():
             strategy.print(f"New ratio of gold labels: {new_gold_ratio:.4f} (target: {percent_gold_label:.4f})")
             
-        train_dataset = concatenate_datasets([train_dataset_gold_label_split, train_dataset_pseudo_label_split]).shuffle(seed=seed)
-                        
+        train_dataset = concatenate_datasets([train_dataset_gold_label_split, train_dataset_pseudo_label_split]).shuffle(seed=seed)                        
     # "within domain" setting
     else: 
         dataset = dataset.remove_columns(cols_to_drop)
+        original_dataset_len = len(dataset)
+        dataset = dataset.filter(lambda x: x["pseudo_label_agreement"] is not None)
+        if strategy.is_rank_0():
+            strategy.print(f"Removed {original_dataset_len - len(dataset)}/{original_dataset_len} rows where {weak_label_column} is null")
         
         # Split dataset into train, val, and test
         train_end_idx = int(len(dataset) * percent_train)
         val_end_idx = train_end_idx + int(len(dataset) * percent_val)
         
         train_dataset = dataset.select(range(train_end_idx))
-        val_dataset = dataset.select(range(train_end_idx, val_end_idx)).remove_columns(["pseudo_label_agreement"])
-        test_dataset = dataset.select(range(val_end_idx, len(dataset))).remove_columns(["pseudo_label_agreement"])
+        val_dataset = dataset.select(range(train_end_idx, val_end_idx))
+        test_dataset = dataset.select(range(val_end_idx, len(dataset)))
         
         if strategy.is_rank_0() and debug:
             strategy.print(f"Dataset splits: train[0:{train_end_idx}], val[{train_end_idx}:{val_end_idx}], test[{val_end_idx}:]")
-            
-        # remove the rows where the weak_label_column is null
-        original_train_dataset_len = len(train_dataset)
-        train_dataset = train_dataset.filter(lambda x: x["pseudo_label_agreement"] is not None)
-        if strategy.is_rank_0():
-            strategy.print(f"Removed {original_train_dataset_len - len(train_dataset)}/{original_train_dataset_len} rows where {weak_label_column} is null")
             
         # randomly select percent_gold_label indices from train_dataset
         gold_label_indices_train = random.sample(range(len(train_dataset)), int(len(train_dataset) * percent_gold_label))
@@ -149,13 +152,14 @@ def create_raw_ppi_datasets(
         train_dataset = train_dataset.map(lambda x, idx: {
             "gold_label_agreement": 1 if idx in gold_label_indices_train else -1
         }, with_indices=True)
+        # for val and test, gold_label_agreement is 1. Doesn't really matter
+        val_dataset = val_dataset.map(lambda x: {"gold_label_agreement": 1})
+        test_dataset = test_dataset.map(lambda x: {"gold_label_agreement": 1})
                 
     if debug:
         for i, dataset in enumerate([train_dataset, val_dataset, test_dataset]):
-            # only the train dataset has is_pseudo_label
-            if i == 0:
-                assert dataset.filter(lambda x: x['pseudo_label_agreement'] is None).num_rows == 0
-                assert dataset.filter(lambda x: x['gold_label_agreement'] is None).num_rows == 0
+            assert dataset.filter(lambda x: x['pseudo_label_agreement'] is None).num_rows == 0, f"There are {dataset.filter(lambda x: x['pseudo_label_agreement'] is None).num_rows} in {dataset} where pseudo_label_agreement is None"
+            assert dataset.filter(lambda x: x['gold_label_agreement'] is None).num_rows == 0, f"There are {dataset.filter(lambda x: x['gold_label_agreement'] is None).num_rows} in {dataset} where gold_label_agreement is None"
                 
             assert dataset.filter(lambda x: x['prompt'] is None).num_rows == 0
             assert dataset.filter(lambda x: x['chosen'] is None).num_rows == 0
@@ -164,7 +168,20 @@ def create_raw_ppi_datasets(
             # assert that all entries in 'chosen' and 'rejected', which are lists of dictionaries, have first dictionary with key 'role' and value 'user'
             assert dataset.filter(lambda x: x['chosen'][0]['role'] != 'user').num_rows == 0
             assert dataset.filter(lambda x: x['rejected'][0]['role'] != 'user').num_rows == 0
-                
+            
+            # assert that the gold_label_agreement is either 1 or -1
+            assert dataset.filter(lambda x: x['gold_label_agreement'] not in [1, -1]).num_rows == 0
+            # assert that the pseudo_label_agreement is either 1 or 0
+            assert dataset.filter(lambda x: x['pseudo_label_agreement'] not in [1, 0]).num_rows == 0
+            
+            if i == 0:
+                for j in range(10):
+                    chunk = dataset.select(range(j * len(dataset) // 10, (j + 1) * len(dataset) // 10))
+                    # check that the proportion of labels with gold_label_agreement is roughly equal to percent_gold_label
+                    assert abs(chunk.filter(lambda x: x['gold_label_agreement'] == 1).num_rows / len(chunk) - percent_gold_label) < 0.03
+                    if strategy.is_rank_0():
+                        strategy.print(f"Chunk {j} has {chunk.filter(lambda x: x['gold_label_agreement'] == 1).num_rows}/{len(chunk)} = {chunk.filter(lambda x: x['gold_label_agreement'] == 1).num_rows / len(chunk):.4f} gold labels")
+            
     return train_dataset, val_dataset, test_dataset
 
 

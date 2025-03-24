@@ -151,3 +151,4 @@ core
 */checkpoint/*
 model_weights/
 wandb/
+checkpoint/

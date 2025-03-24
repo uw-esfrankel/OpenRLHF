@@ -135,7 +135,13 @@ def train(args):
         max_steps = math.ceil(args.max_epochs * num_update_steps_per_epoch)
         max_epochs = args.max_epochs
     strategy.print(f"Training for {max_steps} steps, requires {max_epochs} epochs")
-    breakpoint()
+    if args.save_steps == -1:
+        args.save_steps = max(5, int(max_steps * args.save_pct))
+    if args.eval_steps == -1:
+        args.eval_steps = max(5, int(max_steps * args.eval_pct))
+        if abs(args.save_steps - args.eval_steps) < 5:
+            # just don't eval, good enough to save
+            args.eval_steps = float("inf")
 
     scheduler = get_scheduler(
         "cosine_with_min_lr",
@@ -185,14 +191,6 @@ def train(args):
 
     trainer.fit(args, consumed_samples, num_update_steps_per_epoch)
 
-    # Save value_head_prefix
-    strategy.print("Save value_head_prefix in config")
-    unwrap_model = strategy._unwrap_model(model)
-    unwrap_model.config.value_head_prefix = args.value_head_prefix
-
-    # save model checkpoint after fitting on only rank0
-    strategy.save_model(model, tokenizer, args.save_path)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -200,8 +198,10 @@ if __name__ == "__main__":
     # Checkpoint
     parser.add_argument("--save_path", type=str, default="./ckpt")
     parser.add_argument("--save_steps", type=int, default=-1)
+    parser.add_argument("--save_pct", type=float, default=0.1)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--eval_steps", type=int, default=-1)
+    parser.add_argument("--eval_pct", type=float, default=0.05)
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_rm")
     parser.add_argument("--max_ckpt_num", type=int, default=3)
     parser.add_argument("--max_ckpt_mem", type=int, default=1e8)
@@ -284,9 +284,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_len", type=int, default=512)
     
     # PPI parameters
-    parser.add_argument("--percent_train", type=float, default=0.7)
-    parser.add_argument("--percent_val", type=float, default=0.15)
-    parser.add_argument("--percent_test", type=float, default=0.15)
+    parser.add_argument("--percent_train", type=float, default=0.8)
+    parser.add_argument("--percent_val", type=float, default=0.1)
+    parser.add_argument("--percent_test", type=float, default=0.1)
     
     parser.add_argument("--target_dataset", type=str, default=None)
     parser.add_argument("--target_split", type=str, default=None)
@@ -301,8 +301,8 @@ if __name__ == "__main__":
     # 4: training on the pseudo labels and gold labels with DRPA, switching from training on only the pseudo labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
     # 5: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps
     # 6: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps. Small set of gold labels
-    # 7: (time permitting) training only on the high-confidence pseudo labels + gold labels
-    parser.add_argument("--ppi_train_type", type=int, choices=[0, 1, 2, 3, 4, 5, 6], required=True)
+    # 7: training on the pseudo labels and gold labels with DRPA, switching from training on only the gold labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
+    parser.add_argument("--ppi_train_type", type=int, choices=[0, 1, 2, 3, 4, 5, 6, 7], required=True)
     parser.add_argument("--lbda", type=float)
     parser.add_argument("--force_steps", type=int, default=-1)
     

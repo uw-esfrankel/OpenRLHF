@@ -1,5 +1,7 @@
+import json
 import os
 from abc import ABC
+import shutil
 
 import torch
 from torch.optim import Optimizer
@@ -93,6 +95,11 @@ class PPIRewardModelTrainer(ABC):
                 config=strategy.args.__dict__,
                 reinit=True,
             )
+            
+            # add the args as a file to wandb
+            with open("args_for_wandb.json", "w") as f:
+                json.dump(strategy.args.__dict__, f)
+            wandb.save("args_for_wandb.json")
 
             wandb.define_metric("train/global_step")
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
@@ -109,6 +116,10 @@ class PPIRewardModelTrainer(ABC):
             log_dir = os.path.join(self.strategy.args.use_tensorboard, strategy.args.wandb_run_name)
             self._tensorboard = SummaryWriter(log_dir=log_dir)
 
+        # Add tracking for best models
+        self.top_k = 1  # Track top 1 models
+        self.best_val_losses = []  # List of (val_loss, step) tuples
+
     def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
         # get eval and save steps
         if args.eval_steps == -1:
@@ -121,6 +132,8 @@ class PPIRewardModelTrainer(ABC):
             
         if self.strategy.is_rank_0():
             self.strategy.print(f"Taking a total of {total_steps} steps")
+            self.strategy.print(f"Evaluating every {args.eval_steps} steps")
+            self.strategy.print(f"Saving every {args.save_steps} steps")
             
         if self.ppi_train_type in [4, 5]:
             # get the number of steps to switch from training on only the pseudo labels to training on both the pseudo and gold labels
@@ -189,7 +202,8 @@ class PPIRewardModelTrainer(ABC):
                 # 3: training on both the pseudo and gold labels
                 # 4: training on the pseudo labels and gold labels with DRPA, switching from training on only the pseudo labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
                 # 5: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps
-                # 6: (time permitting) training only on the high-confidence pseudo labels + gold labels
+                # 6: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps. Small set of gold labels
+                # 7: training on the pseudo labels and gold labels with DRPA, switching from training on only the gold labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
                 
                 assert margin is None, "Margin should be None for PPI training type 0"
                 
@@ -277,31 +291,67 @@ class PPIRewardModelTrainer(ABC):
                         
                         # when gold_label_agreement is 1, we can "see" the gold labels
                         gold_label_indices = gold_label_agreement == 1
-                        # get the gold label loss on only the gold labels
-                        small_gold_label_loss = self.loss_fn(chosen_reward[gold_label_indices], reject_reward[gold_label_indices])
-                        # get the pseudo label loss on the same indices
-                        small_pseudo_label_loss = self.compute_pseudo_label_loss(chosen_reward[gold_label_indices], reject_reward[gold_label_indices], pseudo_label_agreement[gold_label_indices])
                         
-                        # doubly robust preference loss
-                        preference_loss = total_pseudo_label_loss - small_pseudo_label_loss + small_gold_label_loss
-                        
-                # 5: training on the pseudo labels and all gold labels, where we initially train on only the pseudo labels, then switch to all the gold labels after fraction lbda of total training steps
+                        # Check if we have any gold labels
+                        if gold_label_indices.any():
+                            # get the gold label loss on only the gold labels
+                            small_gold_label_loss = self.loss_fn(chosen_reward[gold_label_indices], reject_reward[gold_label_indices])
+                            # get the pseudo label loss on the same indices
+                            small_pseudo_label_loss = self.compute_pseudo_label_loss(chosen_reward[gold_label_indices], reject_reward[gold_label_indices], pseudo_label_agreement[gold_label_indices])
+                            
+                            # doubly robust preference loss
+                            preference_loss = total_pseudo_label_loss - small_pseudo_label_loss + small_gold_label_loss
+                        else:
+                            # If no gold labels available, just use the total pseudo label loss
+                            preference_loss = total_pseudo_label_loss
+                    
+                    assert not torch.isnan(preference_loss), "Preference loss is nan"
+                # 5: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps
                 elif self.ppi_train_type == 5:
                     if global_step < switch_steps:
                         preference_loss = self.compute_pseudo_label_loss(chosen_reward, reject_reward, pseudo_label_agreement)
                     else:
                         preference_loss = self.loss_fn(chosen_reward, reject_reward)
-                # 6: training on the pseudo labels and limited set of gold labels, where we initially train on only the pseudo labels, then switch to the small set of gold labels after fraction lbda of total training steps
+                # 6: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps
                 elif self.ppi_train_type == 6:
                     if global_step < switch_steps:
                         preference_loss = self.compute_pseudo_label_loss(chosen_reward, reject_reward, pseudo_label_agreement)
                     else:
                         gold_label_indices = gold_label_agreement == 1
-                        preference_loss = self.loss_fn(chosen_reward[gold_label_indices], reject_reward[gold_label_indices])
-                # 7: (time permitting) training only on the high-confidence pseudo labels + gold labels
+                        if gold_label_indices.any():
+                            preference_loss = self.loss_fn(chosen_reward[gold_label_indices], reject_reward[gold_label_indices])
+                        else:
+                            preference_loss = 0
+                            
+                    assert not torch.isnan(preference_loss), "Preference loss is nan"
+                # 7: training on the pseudo labels and gold labels with DRPA, switching from training on only the gold labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
                 elif self.ppi_train_type == 7:
-                    # TODO: implement this
-                    pass
+                    # if we are before the switch step, we only use the gold labels
+                    if global_step < switch_steps:
+                        gold_label_indices = gold_label_agreement == 1
+                        if gold_label_indices.any():
+                            preference_loss = self.loss_fn(chosen_reward[gold_label_indices], reject_reward[gold_label_indices])
+                        else:
+                            preference_loss = 0
+                    else:
+                        # has already taken the mean, this is over all available
+                        total_pseudo_label_loss = self.compute_pseudo_label_loss(chosen_reward, reject_reward, pseudo_label_agreement)
+                        
+                        # when gold_label_agreement is 1, we can "see" the gold labels
+                        gold_label_indices = gold_label_agreement == 1
+                        
+                        # Check if we have any gold labels
+                        if gold_label_indices.any():
+                            # get the gold label loss on only the gold labels
+                            small_gold_label_loss = self.loss_fn(chosen_reward[gold_label_indices], reject_reward[gold_label_indices])
+                            # get the pseudo label loss on the same indices
+                            small_pseudo_label_loss = self.compute_pseudo_label_loss(chosen_reward[gold_label_indices], reject_reward[gold_label_indices], pseudo_label_agreement[gold_label_indices])
+                            
+                            # doubly robust preference loss
+                            preference_loss = total_pseudo_label_loss - small_pseudo_label_loss + small_gold_label_loss
+                        else:
+                            # If no gold labels available, just use the total pseudo label loss
+                            preference_loss = total_pseudo_label_loss
                     
                 # mixtral
                 if not self.aux_loss:
@@ -344,6 +394,34 @@ class PPIRewardModelTrainer(ABC):
                 if self.max_steps > 0 and global_step >= self.max_steps:
                     break
             epoch_bar.update()
+            
+        # one last eval
+        if len(self.val_dataloader) > 0:
+            val_loss, val_acc_mean, val_reward_mean, val_reward_std = self.evaluate(self.val_dataloader, global_step)
+        if len(self.test_dataloader) > 0:
+            test_loss, test_acc_mean, test_reward_mean, test_reward_std = self.evaluate(self.test_dataloader, global_step, is_val=False)
+        
+        # Save value_head_prefix
+        self.strategy.print("Save value_head_prefix in config")
+        unwrap_model = self.strategy._unwrap_model(self.model)
+        unwrap_model.config.value_head_prefix = args.value_head_prefix
+
+        # save model checkpoint after fitting on only rank0
+        output_dir = os.path.join(args.save_path, "final")
+        self.strategy.save_model(self.model, self.tokenizer, output_dir)
+        # save val and test metrics in json
+        metrics_dict = {
+            "val_loss": val_loss,
+            "val_acc_mean": val_acc_mean,
+            "val_reward_mean": val_reward_mean,
+            "val_reward_std": val_reward_std,
+            "test_loss": test_loss,
+            "test_acc_mean": test_acc_mean,
+            "test_reward_mean": test_reward_mean,
+            "test_reward_std": test_reward_std,
+        }
+        with open(os.path.join(output_dir, "train_metrics.json"), "w") as f:
+            json.dump(metrics_dict, f)
 
         if self._wandb is not None and self.strategy.is_rank_0():
             self._wandb.finish()
@@ -362,27 +440,77 @@ class PPIRewardModelTrainer(ABC):
                 for k, v in logs_dict.items():
                     self._tensorboard.add_scalar(f"train/{k}", v, global_step)
 
-        # eval
-        if global_step % args.eval_steps == 0:
+        # saving
+        if global_step % args.save_steps == 0:
             # do eval when len(dataloader) > 0, avoid zero division in eval.
             if len(self.val_dataloader) > 0:
-                self.evaluate(self.val_dataloader, global_step)
-            if len(self.test_dataloader) > 0:
-                self.evaluate(self.test_dataloader, global_step, is_val=False)
-        # save ckpt
-        # TODO: save best model on dev, use loss/perplexity on whole dev dataset as metric
-        if global_step % args.save_steps == 0:
-            tag = f"global_step{global_step}"
-            self.strategy.print("Save value_head_prefix in config")
-            unwrap_model = self.strategy._unwrap_model(self.model)
-            unwrap_model.config.value_head_prefix = args.value_head_prefix
-            
-            self.strategy.save_model(self.model, self.tokenizer, args.save_path, tag)
+                val_loss, val_acc_mean, val_reward_mean, val_reward_std = self.evaluate(self.val_dataloader, global_step, is_val=True)
+                
+                # Update best models tracking
+                if len(self.best_val_losses) < self.top_k:
+                    # Not enough models tracked yet, add current one
+                    self.best_val_losses.append((val_loss, global_step))
+                    self.best_val_losses.sort()  # Sort by val_loss
+                    should_save = True
+                else:
+                    # Check if current model is better than worst tracked model
+                    if val_loss < self.best_val_losses[-1][0]:
+                        worst_model = self.best_val_losses.pop()  # Remove worst model
+                        if self.strategy.is_rank_0():
+                            self.strategy.print(f"Removing worst model: {worst_model}")
+                            
+                        # remove the folder holding the checkpoint
+                        tag = f"global_step{worst_model[1]}"
+                        output_dir = os.path.join(args.save_path, tag)
+                        if self.strategy.is_rank_0():
+                            shutil.rmtree(output_dir)
+                        
+                        self.best_val_losses.append((val_loss, global_step))
+                        self.best_val_losses.sort()  # Sort by val_loss
+                        if self.strategy.is_rank_0():
+                            self.strategy.print(f"Current best val losses: {self.best_val_losses}")
+                        should_save = True
+                    else:
+                        should_save = False
+                        
+                if should_save:
+                    if len(self.test_dataloader) > 0:
+                        test_loss, test_acc_mean, test_reward_mean, test_reward_std = self.evaluate(self.test_dataloader, global_step, is_val=False)
+                        
+                    # Save the model if it's in top k
+                    tag = f"global_step{global_step}"
+                    if self.strategy.is_rank_0():
+                        self.strategy.print("Save value_head_prefix in config")
+                    unwrap_model = self.strategy._unwrap_model(self.model)
+                    unwrap_model.config.value_head_prefix = args.value_head_prefix
+                    output_dir = os.path.join(args.save_path, tag)
+                    self.strategy.save_model(self.model, self.tokenizer, output_dir)
+                    # save val and test metrics in json
+                    metrics_dict = {
+                        "val_loss": val_loss,
+                        "val_acc_mean": val_acc_mean,
+                        "val_reward_mean": val_reward_mean,
+                        "val_reward_std": val_reward_std,
+                        "test_loss": test_loss,
+                        "test_acc_mean": test_acc_mean,
+                        "test_reward_mean": test_reward_mean,
+                        "test_reward_std": test_reward_std,
+                    }
+                    with open(os.path.join(output_dir, "train_metrics.json"), "w") as f:
+                        json.dump(metrics_dict, f)
+                
+        # Regular evaling
+        if global_step % args.eval_steps == 0:
+            if self.strategy.is_rank_0():
+                self.strategy.print("Running eval only!")
+            if len(self.val_dataloader) > 0:
+                val_loss, val_acc_mean, val_reward_mean, val_reward_std = self.evaluate(self.val_dataloader, global_step, is_val=True)
+
 
     def evaluate(self, eval_dataloader, steps=0, is_val=False):
         step_bar = tqdm(
             range(eval_dataloader.__len__()),
-            desc="Eval stage of steps %d" % steps,
+            desc=f"{'val' if is_val else 'test'} evaluation stage of steps {steps}",
             disable=not self.strategy.is_rank_0(),
         )
         self.model.eval()
@@ -423,8 +551,8 @@ class PPIRewardModelTrainer(ABC):
                 loss_sum += loss.item()
                 step_bar.update()
 
-            acc_mean = acc / self.eval_dataloader.__len__()
-            loss_mean = loss_sum / self.eval_dataloader.__len__()
+            acc_mean = acc / eval_dataloader.__len__()
+            loss_mean = loss_sum / eval_dataloader.__len__()
 
             rewards = torch.cat(rewards).float()
             rewards = self.strategy.all_gather(rewards)
@@ -440,7 +568,7 @@ class PPIRewardModelTrainer(ABC):
             if is_val:
                 self.strategy.print("Saving val metrics")
             else:
-                self.strategy.print("Saving test metrics")
+                self.strategy.print("Saving test metrics -- TEST")
 
             bar_dict = {
                 "eval_loss": loss_mean,
@@ -463,6 +591,8 @@ class PPIRewardModelTrainer(ABC):
                     for k, v in logs.items():
                         self._tensorboard.add_scalar(f"eval/{k}", v, steps)
         self.model.train()  # reset model state
+        
+        return loss_mean, acc_mean, reward_mean.item(), reward_std.item()
 
     def concatenated_forward(self, model, chosen_ids, c_mask, reject_ids, r_mask):
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
