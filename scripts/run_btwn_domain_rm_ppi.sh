@@ -79,7 +79,7 @@ echo "deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
 --lbda ${lbda} \
 --use_wandb $WANDB_TOKEN \
 --wandb_project ppi-rm-btwn-domain-${formatted_dataset_name}-to-${formatted_target_dataset_name}-pretrain-${formatted_pretrain_model_name}-ps-${pseudo_label_model}-pct-gold${percent_gold_label} \
---wandb_run_name ppi_type${ppi_type}-lbda${lbda}"
+--wandb_run_name ppi_type${ppi_type}-lbda${lbda}-ep${max_epoch}-bs${batch_size}-lr${lr}"
 
 # Instead of creating a file, directly run the command
 deepspeed --module openrlhf.cli.train_rm_ppi \
@@ -112,4 +112,4 @@ deepspeed --module openrlhf.cli.train_rm_ppi \
 --lbda ${lbda} \
 --use_wandb $WANDB_TOKEN \
 --wandb_project ppi-rm-btwn-domain-${formatted_dataset_name}-to-${formatted_target_dataset_name}-pretrain-${formatted_pretrain_model_name}-ps-${pseudo_label_model}-pct-gold${percent_gold_label} \
---wandb_run_name ppi_type${ppi_type}-lbda${lbda}
+--wandb_run_name ppi_type${ppi_type}-lbda${lbda}-ep${max_epoch}-bs${batch_size}-lr${lr}
