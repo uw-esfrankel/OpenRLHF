@@ -27,7 +27,6 @@ from .deepspeed_utils import (
     get_optimizer_grouped_parameters,
     get_train_ds_config,
 )
-from .async_uploader import AsyncHFUploader
 
 ModelOptimPair = Tuple[nn.Module, Optimizer]
 ModelOrModelOptimPair = Union[nn.Module, ModelOptimPair]
@@ -310,7 +309,7 @@ class DeepspeedStrategy(ABC):
             state_dict = key_replace_fn(state_dict)
         unwrapped_model.load_state_dict(state_dict, strict=strict)
 
-    def save_model(self, model: nn.Module, tokenizer, output_dir, push_to_hub=False, repo_name=None, **kwargs) -> None:
+    def save_model(self, model: nn.Module, tokenizer, output_dir, **kwargs) -> None:
         if self.is_rank_0():
             os.makedirs(output_dir, exist_ok=True)
 
@@ -377,36 +376,6 @@ class DeepspeedStrategy(ABC):
                         shutil.copy(os.path.join(train_from_model_path, filename), os.path.join(output_dir, filename))
         dist.barrier()
         torch.cuda.synchronize()
-
-            # Handle Hugging Face Hub upload if requested
-            if push_to_hub and repo_name:
-                # Get the revision from the output_dir name
-                revision = os.path.basename(output_dir)
-                
-                # Initialize the uploader only on rank 0
-                try:
-                    # Get base directory from the output_dir (parent of the step directory)
-                    base_dir = os.path.dirname(output_dir)
-                    uploader = AsyncHFUploader(base_dir)
-                    
-                    # Queue this model for upload
-                    upload_id = uploader.queue_upload(
-                        model_dir=output_dir,
-                        repo_name=repo_name,
-                        revision=revision,
-                        priority=0  # Default priority
-                    )
-                    
-                    print(f"Queued model upload with ID: {upload_id}")
-                    
-                except ImportError:
-                    print("Module dependencies missing. Skipping async upload.")
-                except Exception as e:
-                    print(f"Error setting up asynchronous upload: {e}")
-        
-        # Add a barrier to ensure all processes stay synchronized for the save operation
-        # but not for the upload which happens asynchronously
-        dist.barrier()
 
     def all_reduce(self, data, op="mean"):
         assert op in ("mean", "max", "sum")

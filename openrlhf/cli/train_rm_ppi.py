@@ -5,6 +5,7 @@ from datetime import datetime
 
 from transformers.trainer import get_scheduler
 
+from torch import distributed as dist
 from openrlhf.datasets import PPIRewardDataset
 from openrlhf.models import get_llm_for_sequence_regression
 from openrlhf.trainer import PPIRewardModelTrainer
@@ -42,8 +43,7 @@ def train(args):
     # configure optimizer
     optim = strategy.create_optimizer(model, lr=args.learning_rate, betas=args.adam_betas, weight_decay=args.l2)
     
-    if strategy.is_rank_0():
-        strategy.print("*" * 100)
+    strategy.print("*" * 100)
     
     train_dataset, val_dataset, test_dataset = create_raw_ppi_datasets(
         dataset=args.dataset,
@@ -59,9 +59,8 @@ def train(args):
         debug=args.debug
     )
     
-    if strategy.is_rank_0():
-        strategy.print("*" * 100)
-        strategy.print(f"PPI training type: {args.ppi_train_type}.")
+    strategy.print("*" * 100)
+    strategy.print(f"PPI training type: {args.ppi_train_type}.")
     orig_train_dataset_len = len(train_dataset)
     
     assert abs(len(train_dataset.filter(lambda x: x["gold_label_agreement"] == 1)) / orig_train_dataset_len - args.percent_gold_label) < 0.02
@@ -140,6 +139,7 @@ def train(args):
     if args.eval_steps == -1:
         args.eval_steps = max(5, int(max_steps * args.eval_pct))
         if abs(args.save_steps - args.eval_steps) < 5:
+            strategy.print("Eval and save steps are too close together; just saving")
             # just don't eval, good enough to save
             args.eval_steps = float("inf")
 
@@ -190,6 +190,14 @@ def train(args):
     )
 
     trainer.fit(args, consumed_samples, num_update_steps_per_epoch)
+    
+    # Save value_head_prefix
+    strategy.print("Save value_head_prefix in config")
+    unwrap_model = strategy._unwrap_model(model)
+    unwrap_model.config.value_head_prefix = args.value_head_prefix
+
+    # save model checkpoint after fitting on only rank0
+    strategy.save_model(model, tokenizer, os.path.join(args.save_path, "final-no-eval"))
 
 
 if __name__ == "__main__":

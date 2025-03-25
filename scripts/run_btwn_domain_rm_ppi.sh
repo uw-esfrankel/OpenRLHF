@@ -51,15 +51,16 @@ formatted_pretrain_model_name=$(format_pretrain_model_name ${pretrain_model})
 
 echo "deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
 --save_path ./checkpoint/btwn_domain_rm_ppi \
---save_pct 0.05 \
+--save_pct 0.1 \
 --logging_steps 1 \
---eval_pct 0.025 \
+--eval_pct 0.05 \
 --train_batch_size ${batch_size} \
 --micro_train_batch_size 8 \
 --pretrain ${pretrain_model} \
 --bf16 \
+--flash_attn \
 --max_epochs ${max_epoch} \
---max_len 4096 \
+--max_len 2048 \
 --zero_stage 1 \
 --learning_rate ${lr} \
 --dataset ${dataset} \
@@ -81,17 +82,18 @@ echo "deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
 --wandb_run_name ppi-rm-btwn-domain-${formatted_dataset_name}-to-${formatted_target_dataset_name}-${formatted_pretrain_model_name}-ppi_type${ppi_type}-percent_gold_label${percent_gold_label}-lbda${lbda}-pseudo_label_model${pseudo_label_model}"
 
 # Instead of creating a file, directly run the command
-deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
+deepspeed --module openrlhf.cli.train_rm_ppi \
 --save_path ./checkpoint/btwn_domain_rm_ppi \
---save_pct 0.05 \
+--save_pct 0.1 \
 --logging_steps 1 \
---eval_pct 0.025 \
+--eval_pct 0.05 \
 --train_batch_size ${batch_size} \
 --micro_train_batch_size 8 \
 --pretrain ${pretrain_model} \
 --bf16 \
+--flash_attn \
 --max_epochs ${max_epoch} \
---max_len 4096 \
+--max_len 2048 \
 --zero_stage 1 \
 --learning_rate ${lr} \
 --dataset ${dataset} \

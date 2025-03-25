@@ -7,6 +7,7 @@ import torch
 from torch.optim import Optimizer
 from tqdm import tqdm
 
+from torch import distributed as dist
 from openrlhf.models import LogExpLoss, PairWiseLoss
 from openrlhf.utils.distributed_sampler import DistributedSampler
 
@@ -117,8 +118,7 @@ class PPIRewardModelTrainer(ABC):
             self._tensorboard = SummaryWriter(log_dir=log_dir)
 
         # Add tracking for best models
-        self.top_k = 1  # Track top 1 models
-        self.best_val_losses = []  # List of (val_loss, step) tuples
+        self.best_val_loss_model = (float("inf"), "")
 
     def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
         # get eval and save steps
@@ -130,10 +130,9 @@ class PPIRewardModelTrainer(ABC):
         # get total number of steps
         total_steps = self.epochs * num_update_steps_per_epoch
             
-        if self.strategy.is_rank_0():
-            self.strategy.print(f"Taking a total of {total_steps} steps")
-            self.strategy.print(f"Evaluating every {args.eval_steps} steps")
-            self.strategy.print(f"Saving every {args.save_steps} steps")
+        self.strategy.print(f"Taking a total of {total_steps} steps")
+        self.strategy.print(f"Evaluating every {args.eval_steps} steps")
+        self.strategy.print(f"Saving every {args.save_steps} steps")
             
         if self.ppi_train_type in [4, 5]:
             # get the number of steps to switch from training on only the pseudo labels to training on both the pseudo and gold labels
@@ -395,34 +394,8 @@ class PPIRewardModelTrainer(ABC):
                     break
             epoch_bar.update()
             
-        # one last eval
-        if len(self.val_dataloader) > 0:
-            val_loss, val_acc_mean, val_reward_mean, val_reward_std = self.evaluate(self.val_dataloader, global_step)
-        if len(self.test_dataloader) > 0:
-            test_loss, test_acc_mean, test_reward_mean, test_reward_std = self.evaluate(self.test_dataloader, global_step, is_val=False)
-        
-        # Save value_head_prefix
-        self.strategy.print("Save value_head_prefix in config")
-        unwrap_model = self.strategy._unwrap_model(self.model)
-        unwrap_model.config.value_head_prefix = args.value_head_prefix
-
-        # save model checkpoint after fitting on only rank0
-        output_dir = os.path.join(args.save_path, "final")
-        self.strategy.save_model(self.model, self.tokenizer, output_dir)
-        # save val and test metrics in json
-        metrics_dict = {
-            "val_loss": val_loss,
-            "val_acc_mean": val_acc_mean,
-            "val_reward_mean": val_reward_mean,
-            "val_reward_std": val_reward_std,
-            "test_loss": test_loss,
-            "test_acc_mean": test_acc_mean,
-            "test_reward_mean": test_reward_mean,
-            "test_reward_std": test_reward_std,
-        }
-        with open(os.path.join(output_dir, "train_metrics.json"), "w") as f:
-            json.dump(metrics_dict, f)
-
+        self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict, client_states)
+                        
         if self._wandb is not None and self.strategy.is_rank_0():
             self._wandb.finish()
         if self._tensorboard is not None and self.strategy.is_rank_0():
@@ -440,52 +413,77 @@ class PPIRewardModelTrainer(ABC):
                 for k, v in logs_dict.items():
                     self._tensorboard.add_scalar(f"train/{k}", v, global_step)
 
-        # saving
-        if global_step % args.save_steps == 0:
+        # eval
+        if global_step % args.eval_steps == 0:
             # do eval when len(dataloader) > 0, avoid zero division in eval.
             if len(self.val_dataloader) > 0:
+                self.evaluate(self.val_dataloader, global_step, is_val=True)
+            if len(self.test_dataloader) > 0:
+                self.evaluate(self.test_dataloader, global_step, is_val=False)
+            
+        # save ckpt
+        if global_step % args.save_steps == 0 or global_step == self.max_steps:
+            # Make sure all processes are synchronized before evaluation
+            dist.barrier()
+            
+            val_loss = float("inf")
+            val_acc_mean = 0
+            val_reward_mean = 0
+            val_reward_std = 0
+            test_loss = float("inf")
+            test_acc_mean = 0
+            test_reward_mean = 0
+            test_reward_std = 0
+            
+            # Perform validation if the dataloader exists
+            if len(self.val_dataloader) > 0:
                 val_loss, val_acc_mean, val_reward_mean, val_reward_std = self.evaluate(self.val_dataloader, global_step, is_val=True)
+            
+            # Check if this is the best model
+            is_best = val_loss < self.best_val_loss_model[0]
+            
+            # Broadcast the is_best value from rank 0 to all ranks to ensure consistency
+            is_best_tensor = torch.tensor([1 if is_best else 0], device=torch.cuda.current_device())
+            dist.broadcast(is_best_tensor, src=0)
+            is_best = bool(is_best_tensor.item())
+            
+            # If this is the best model, evaluate on test set (if available)
+            if is_best and len(self.test_dataloader) > 0:
+                test_loss, test_acc_mean, test_reward_mean, test_reward_std = self.evaluate(self.test_dataloader, global_step, is_val=False)
+            
+            # Make sure all processes are synchronized before model saving
+            dist.barrier()
+            
+            if is_best:
+                old_step = self.best_val_loss_model[1]
+                tag = f"global_step{global_step}"
                 
-                # Update best models tracking
-                if len(self.best_val_losses) < self.top_k:
-                    # Not enough models tracked yet, add current one
-                    self.best_val_losses.append((val_loss, global_step))
-                    self.best_val_losses.sort()  # Sort by val_loss
-                    should_save = True
-                else:
-                    # Check if current model is better than worst tracked model
-                    if val_loss < self.best_val_losses[-1][0]:
-                        worst_model = self.best_val_losses.pop()  # Remove worst model
-                        if self.strategy.is_rank_0():
-                            self.strategy.print(f"Removing worst model: {worst_model}")
-                            
-                        # remove the folder holding the checkpoint
-                        tag = f"global_step{worst_model[1]}"
-                        output_dir = os.path.join(args.save_path, tag)
-                        if self.strategy.is_rank_0():
-                            shutil.rmtree(output_dir)
-                        
-                        self.best_val_losses.append((val_loss, global_step))
-                        self.best_val_losses.sort()  # Sort by val_loss
-                        if self.strategy.is_rank_0():
-                            self.strategy.print(f"Current best val losses: {self.best_val_losses}")
-                        should_save = True
-                    else:
-                        should_save = False
-                        
-                if should_save:
-                    if len(self.test_dataloader) > 0:
-                        test_loss, test_acc_mean, test_reward_mean, test_reward_std = self.evaluate(self.test_dataloader, global_step, is_val=False)
-                        
-                    # Save the model if it's in top k
-                    tag = f"global_step{global_step}"
-                    if self.strategy.is_rank_0():
-                        self.strategy.print("Save value_head_prefix in config")
-                    unwrap_model = self.strategy._unwrap_model(self.model)
-                    unwrap_model.config.value_head_prefix = args.value_head_prefix
-                    output_dir = os.path.join(args.save_path, tag)
-                    self.strategy.save_model(self.model, self.tokenizer, output_dir)
-                    # save val and test metrics in json
+                if self.strategy.is_rank_0():
+                    self.strategy.print(f"New best val loss {val_loss} at step {global_step}")
+                    
+                    # Remove old model if it exists
+                    if old_step != "":
+                        old_path = os.path.join(args.save_path, old_step)
+                        if os.path.exists(old_path):
+                            shutil.rmtree(old_path)
+                            self.strategy.print(f"Removed saved model weights at step {old_step}")
+                    
+                    # Save value_head_prefix in config
+                    self.strategy.print("Save value_head_prefix in config")
+                
+                # Update best model info
+                self.best_val_loss_model = (val_loss, tag)
+                
+                # Set value_head_prefix in config
+                unwrap_model = self.strategy._unwrap_model(self.model)
+                unwrap_model.config.value_head_prefix = args.value_head_prefix
+                
+                # Save the model
+                output_dir = os.path.join(args.save_path, tag)
+                self.strategy.save_model(self.model, self.tokenizer, output_dir)
+                
+                # Save metrics (only on rank 0)
+                if self.strategy.is_rank_0():
                     metrics_dict = {
                         "val_loss": val_loss,
                         "val_acc_mean": val_acc_mean,
@@ -496,16 +494,13 @@ class PPIRewardModelTrainer(ABC):
                         "test_reward_mean": test_reward_mean,
                         "test_reward_std": test_reward_std,
                     }
+                    
                     with open(os.path.join(output_dir, "train_metrics.json"), "w") as f:
                         json.dump(metrics_dict, f)
-                
-        # Regular evaling
-        if global_step % args.eval_steps == 0:
-            if self.strategy.is_rank_0():
-                self.strategy.print("Running eval only!")
-            if len(self.val_dataloader) > 0:
-                val_loss, val_acc_mean, val_reward_mean, val_reward_std = self.evaluate(self.val_dataloader, global_step, is_val=True)
-
+            
+            # Final barrier to ensure all processes are synchronized before continuing
+            dist.barrier()
+            
 
     def evaluate(self, eval_dataloader, steps=0, is_val=False):
         step_bar = tqdm(
@@ -518,6 +513,7 @@ class PPIRewardModelTrainer(ABC):
             acc = 0
             rewards = []
             loss_sum = 0
+            
             for data in eval_dataloader:
                 if not self.packing_samples:
                     chosen_ids, c_mask, reject_ids, r_mask, _, _, margin = data
@@ -551,16 +547,22 @@ class PPIRewardModelTrainer(ABC):
                 loss_sum += loss.item()
                 step_bar.update()
 
-            acc_mean = acc / eval_dataloader.__len__()
-            loss_mean = loss_sum / eval_dataloader.__len__()
-
+            # Make sure we synchronize before computing metrics
+            dist.barrier()
+            
+            # Calculate local metrics first
+            local_acc_mean = acc / eval_dataloader.__len__()
+            local_loss_mean = loss_sum / eval_dataloader.__len__()
+            
+            # Gather and compute global metrics
             rewards = torch.cat(rewards).float()
+            
+            # Use all_gather to collect rewards from all processes
             rewards = self.strategy.all_gather(rewards)
             reward_mean = torch.mean(rewards)
             reward_std = torch.std(rewards).clamp(min=1e-8)
 
-            # save mean std
-            self.strategy.print("Set reward mean std")
+            # Save mean std to model config
             unwrap_model = self.strategy._unwrap_model(self.model)
             unwrap_model.config.mean = reward_mean.item()
             unwrap_model.config.std = reward_std.item()
@@ -570,29 +572,37 @@ class PPIRewardModelTrainer(ABC):
             else:
                 self.strategy.print("Saving test metrics -- TEST")
 
+            # Calculate global metrics using all_reduce
             bar_dict = {
-                "eval_loss": loss_mean,
-                "acc_mean": acc_mean,
+                "eval_loss": local_loss_mean,
+                "acc_mean": local_acc_mean,
                 "reward_mean": reward_mean.item(),
                 "reward_std": reward_std.item(),
             }
             logs = self.strategy.all_reduce(bar_dict)
             step_bar.set_postfix(logs)
 
-            histgram = torch.histogram(rewards.cpu(), bins=10, range=(-10, 10), density=True) * 2
-            self.strategy.print("histgram")
-            self.strategy.print(histgram)
-
             if self.strategy.is_rank_0():
+                # Only log histogram on rank 0
+                histgram = torch.histogram(rewards.cpu(), bins=10, range=(-10, 10), density=True) * 2
+                self.strategy.print("histgram")
+                self.strategy.print(histgram)
+                
+                # Log to wandb or tensorboard
                 if self._wandb is not None:
                     logs = {f"{'val' if is_val else 'test'}/%s" % k: v for k, v in {**logs, "global_step": steps}.items()}
                     self._wandb.log(logs)
                 elif self._tensorboard is not None:
                     for k, v in logs.items():
                         self._tensorboard.add_scalar(f"eval/{k}", v, steps)
-        self.model.train()  # reset model state
         
-        return loss_mean, acc_mean, reward_mean.item(), reward_std.item()
+        # Make sure all processes finish evaluation
+        dist.barrier()
+        
+        # Reset model to training mode
+        self.model.train()
+        
+        return local_loss_mean, local_acc_mean, reward_mean.item(), reward_std.item()
 
     def concatenated_forward(self, model, chosen_ids, c_mask, reject_ids, r_mask):
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
