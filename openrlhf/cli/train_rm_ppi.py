@@ -196,9 +196,6 @@ def train(args):
     unwrap_model = strategy._unwrap_model(model)
     unwrap_model.config.value_head_prefix = args.value_head_prefix
 
-    # save model checkpoint after fitting on only rank0
-    strategy.save_model(model, tokenizer, os.path.join(args.save_path, "final-no-eval"))
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

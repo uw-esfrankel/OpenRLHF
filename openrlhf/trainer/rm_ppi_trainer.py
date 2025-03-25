@@ -448,21 +448,21 @@ class PPIRewardModelTrainer(ABC):
             is_best = bool(is_best_tensor.item())
             
             # If this is the best model, evaluate on test set (if available)
-            if is_best and len(self.test_dataloader) > 0:
+            if (is_best or global_step == self.max_steps) and len(self.test_dataloader) > 0:
                 test_loss, test_acc_mean, test_reward_mean, test_reward_std = self.evaluate(self.test_dataloader, global_step, is_val=False)
             
             # Make sure all processes are synchronized before model saving
             dist.barrier()
             
-            if is_best:
+            if is_best or global_step == self.max_steps:
                 old_step = self.best_val_loss_model[1]
-                tag = f"global_step{global_step}"
+                tag = f"global_step{global_step}" if global_step != self.max_steps else "final"
                 
                 if self.strategy.is_rank_0():
                     self.strategy.print(f"New best val loss {val_loss} at step {global_step}")
                     
                     # Remove old model if it exists
-                    if old_step != "":
+                    if old_step != "" and global_step != self.max_steps:
                         old_path = os.path.join(args.save_path, old_step)
                         if os.path.exists(old_path):
                             shutil.rmtree(old_path)
