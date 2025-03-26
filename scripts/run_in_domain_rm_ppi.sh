@@ -39,7 +39,7 @@ formatted_pretrain_model_name=$(format_pretrain_model_name ${pretrain_model})
 # Print the command
 echo "deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
 --save_path ./checkpoint/in_domain_rm_ppi \
---save_pct 0.1 \
+--save_pct 1.0 \
 --logging_steps 1 \
 --eval_pct 0.05 \
 --train_batch_size ${batch_size} \
@@ -70,7 +70,7 @@ echo "deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
 # Instead of creating a file, directly run the command
 deepspeed --module openrlhf.cli.train_rm_ppi \
 --save_path ./checkpoint/in_domain_rm_ppi \
---save_pct 0.1 \
+--save_pct 1.0 \
 --logging_steps 1 \
 --eval_pct 0.05 \
 --train_batch_size ${batch_size} \
