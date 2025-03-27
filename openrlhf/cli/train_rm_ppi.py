@@ -125,7 +125,7 @@ def train(args):
         test_dataset.packing_collate_fn if args.packing_samples else test_dataset.collate_fn,
     )
     # scheduler
-    num_update_steps_per_epoch = len(train_dataset) // args.train_batch_size
+    num_update_steps_per_epoch = max(len(train_dataset) // args.train_batch_size, 1)
     if args.ppi_train_type == 2:
         max_steps = orig_train_dataset_len // args.train_batch_size * args.max_epochs
         # number of epochs is however many needed to reach force_steps
