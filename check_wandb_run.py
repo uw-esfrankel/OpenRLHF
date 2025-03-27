@@ -1,10 +1,11 @@
 import wandb
 import argparse
+import os
 import sys
 
 def check_run_finished(project_path, run_name):
     # Initialize the API
-    api = wandb.Api()
+    api = wandb.Api(api_key=os.environ["WANDB_TOKEN"])
     
     try:
         # Search for runs with the specific name in the project
