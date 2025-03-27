@@ -36,6 +36,18 @@ dataset_split=${dataset_splits[${dataset_idx}]}
 formatted_dataset_name=$(format_dataset_name ${dataset})
 formatted_pretrain_model_name=$(format_pretrain_model_name ${pretrain_model})
 
+wandb_project=ppi-rm-in-domain-${formatted_dataset_name}-pretrain-${formatted_pretrain_model_name}-ps-${pseudo_label_model}-pct-gold${percent_gold_label}
+wandb_run_name=ppi_type${ppi_type}-lbda${lbda}-ep${max_epoch}-bs${batch_size}-lr${lr}
+
+if python check_wandb_run.py --project $wandb_project --name $wandb_run_name; then
+    echo "Run is finished"
+    exit 0
+else
+    echo "Run is not finished yet"
+    # Continue execution to start/resume the run
+fi
+
+
 # Print the command
 echo "deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
 --save_path ./checkpoint/in_domain_rm_ppi \
@@ -64,8 +76,8 @@ echo "deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
 --ppi_train_type ${ppi_type} \
 --lbda ${lbda} \
 --use_wandb $WANDB_TOKEN \
---wandb_project ppi-rm-in-domain-${formatted_dataset_name}-pretrain-${formatted_pretrain_model_name}-ps-${pseudo_label_model}-pct-gold${percent_gold_label} \
---wandb_run_name ppi_type${ppi_type}-lbda${lbda}-ep${max_epoch}-bs${batch_size}-lr${lr}"
+--wandb_project $wandb_project \
+--wandb_run_name $wandb_run_name"
 
 # Instead of creating a file, directly run the command
 deepspeed --module openrlhf.cli.train_rm_ppi \
@@ -95,5 +107,5 @@ deepspeed --module openrlhf.cli.train_rm_ppi \
 --ppi_train_type ${ppi_type} \
 --lbda ${lbda} \
 --use_wandb $WANDB_TOKEN \
---wandb_project ppi-rm-in-domain-${formatted_dataset_name}-pretrain-${formatted_pretrain_model_name}-ps-${pseudo_label_model}-pct-gold${percent_gold_label} \
---wandb_run_name ppi_type${ppi_type}-lbda${lbda}-ep${max_epoch}-bs${batch_size}-lr${lr}
+--wandb_project $wandb_project \
+--wandb_run_name $wandb_run_name
