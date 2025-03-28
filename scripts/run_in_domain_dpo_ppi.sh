@@ -88,7 +88,7 @@ deepspeed --module openrlhf.cli.train_dpo_ppi \
 --logging_steps 1 \
 --eval_pct 0.1 \
 --train_batch_size ${batch_size} \
---micro_train_batch_size 2 \
+--micro_train_batch_size 4 \
 --pretrain ${pretrain_model} \
 --bf16 \
 --max_epochs 1 \
