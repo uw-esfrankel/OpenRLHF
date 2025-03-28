@@ -6,9 +6,11 @@ from .prm_trainer import ProcessRewardModelTrainer
 from .rm_trainer import RewardModelTrainer
 from .sft_trainer import SFTTrainer
 from .rm_ppi_trainer import PPIRewardModelTrainer
+from .dpo_ppi_trainer import PPIDPOTrainer
 
 __all__ = [
     "DPOTrainer",
+    "PPIDPOTrainer",
     "KDTrainer",
     "KTOTrainer",
     "BasePPOTrainer",
