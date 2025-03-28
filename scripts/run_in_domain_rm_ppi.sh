@@ -53,7 +53,7 @@ echo "deepspeed --module --master_port 12345 openrlhf.cli.train_rm_ppi \
 --save_path ./checkpoint/in_domain_rm_ppi \
 --save_pct 1.0 \
 --logging_steps 1 \
---eval_pct 0.05 \
+--eval_pct 1.0 \
 --train_batch_size ${batch_size} \
 --micro_train_batch_size 8 \
 --pretrain ${pretrain_model} \
@@ -84,7 +84,7 @@ deepspeed --module openrlhf.cli.train_rm_ppi \
 --save_path ./checkpoint/in_domain_rm_ppi \
 --save_pct 1.0 \
 --logging_steps 1 \
---eval_pct 0.05 \
+--eval_pct 1.0 \
 --train_batch_size ${batch_size} \
 --micro_train_batch_size 8 \
 --pretrain ${pretrain_model} \
