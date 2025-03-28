@@ -16,7 +16,7 @@ max_epoch=$6
 percent_gold_label=$7
 lbda=$8
 pseudo_label_model=$9
-beta=$10
+beta=${10}
 
 # Dataset configurations
 dataset=("esfrankel17/HelpSteer2_binarized_w_weak_preferences_cleaned" "esfrankel17/ChatbotArena55k_binarized_w_weak_preferences_cleaned" "esfrankel17/UltraFeedback_binarized_w_weak_preferences_cleaned" "esfrankel17/Nectar_binarized_w_weak_preferences_cleaned")

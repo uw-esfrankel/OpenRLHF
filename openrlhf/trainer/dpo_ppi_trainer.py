@@ -191,29 +191,42 @@ class PPIDPOTrainer(ABC):
                             self.ref_model, packed_input_ids, packed_attention_masks, packed_seq_lens, prompt_id_lens
                         )
 
-                # loss function
+                # Different PPI training types
+                # 0: training only on the pseudo labels
+                # 1: training only on the gold labels
+                # 2: training only on the gold labels for the same number of gradient steps as training on the pseudo labels
+                # 3: training on both the pseudo and gold labels
+                # 4: training on the pseudo labels and gold labels with DRPA, switching from training on only the pseudo labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
+                # 5: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps
+                # 6: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps. Small set of gold labels
+                # 7: training on the pseudo labels and gold labels with DRPA, switching from training on only the gold labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
+                
+                # 0: training only on the pseudo labels
                 if self.ppi_train_type == 0:
-                    self.strategy.print("Using pseudos only")
-                    preference_loss, chosen_reward, reject_reward = self.compute_pseudo_label_loss(
+                    preference_loss, chosen_reward, reject_reward = self.compute_pseudo_label_dpo_loss(
                         chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps, pseudo_label_agreement
                     )
+                # 1: training only on the gold labels
+                # 2: training only on the gold labels for same number of gradient steps as training on the pseudo labels
                 elif self.ppi_train_type in [1, 2]:
-                    # chosen_reward and reject_reward are already the gold labels
-                    # 1 has reduced dataset size, so we don't need to do anything
-                    # 2 just has more gradient steps, so we don't need to do anything
+                    # These approaches simply use the standard DPO loss on the gold labels
                     if self.debug:
                         assert torch.all(gold_label_agreement == 1), "gold_label_agreement should be 1"
                     preference_loss, chosen_reward, reject_reward = self.loss_fn(
                         chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
                     )
                 # 3: training on both the pseudo and gold labels
-                elif self.ppi_train_type == 3: 
+                elif self.ppi_train_type == 3:
+                    # when gold_label_agreement is 1, we use those gold labels; when gold_label_agreement is -1, we use the pseudo labels
+                    # same_mask is the indices where the gold labels are 1 OR the pseudo labels are 1
                     same_mask = torch.logical_or(gold_label_agreement == 1, pseudo_label_agreement == 1)
                     diff_mask = ~same_mask
                     
-                    # Initialize combined tensors for chosen and reject rewards
+                    # Initialize combined tensors
                     final_chosen_logps = torch.empty_like(chosen_logps)
                     final_rejected_logps = torch.empty_like(rejected_logps)
+                    final_ref_chosen_logps = torch.empty_like(reference_chosen_logps)
+                    final_ref_rejected_logps = torch.empty_like(reference_rejected_logps)
                     
                     # Assign values based on masks
                     final_chosen_logps[same_mask] = chosen_logps[same_mask]
@@ -222,34 +235,26 @@ class PPIDPOTrainer(ABC):
                     final_rejected_logps[same_mask] = rejected_logps[same_mask]
                     final_rejected_logps[diff_mask] = chosen_logps[diff_mask]
                     
-                    final_reference_chosen_logps = torch.empty_like(reference_chosen_logps)
-                    final_reference_rejected_logps = torch.empty_like(reference_rejected_logps)
-
-                    final_reference_chosen_logps[same_mask] = reference_chosen_logps[same_mask]
-                    final_reference_chosen_logps[diff_mask] = reference_rejected_logps[diff_mask]
-
-                    final_reference_rejected_logps[same_mask] = reference_rejected_logps[same_mask]
-                    final_reference_rejected_logps[diff_mask] = reference_chosen_logps[diff_mask]
+                    final_ref_chosen_logps[same_mask] = reference_chosen_logps[same_mask]
+                    final_ref_chosen_logps[diff_mask] = reference_rejected_logps[diff_mask]
                     
-                    # final_chosen and final_reject should be non-zero and have different values
-                    if self.debug:
-                        assert torch.all(final_chosen_logps != 0), "final_chosen should be non-zero"
-                        assert torch.all(final_rejected_logps != 0), "final_reject should be non-zero"
-                        if torch.all(chosen_reward != reject_reward):
-                            assert torch.all(final_chosen_logps != final_rejected_logps), "final_chosen and final_reject should have different values"
-                            
+                    final_ref_rejected_logps[same_mask] = reference_rejected_logps[same_mask]
+                    final_ref_rejected_logps[diff_mask] = reference_chosen_logps[diff_mask]
+                    
                     preference_loss, chosen_reward, reject_reward = self.loss_fn(
-                        final_chosen_logps, final_rejected_logps, final_reference_chosen_logps, final_reference_rejected_logps
+                        final_chosen_logps, final_rejected_logps, final_ref_chosen_logps, final_ref_rejected_logps
                     )
+                    
+                # 4: training on the pseudo labels and gold labels with DRPA, switching from training on only the pseudo labels to training on both the pseudo and gold labels with DR loss after fraction lbda of total training steps
                 elif self.ppi_train_type == 4:
                     # if we are before the switch step, we only use the pseudo labels
                     if global_step < switch_steps:
-                        preference_loss, chosen_reward, reject_reward = self.compute_pseudo_label_loss(
+                        preference_loss, chosen_reward, reject_reward = self.compute_pseudo_label_dpo_loss(
                             chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps, pseudo_label_agreement
                         )
-                    else:                    
-                        # has already taken the mean, this is over all available
-                        total_pseudo_label_loss, total_pseudo_label_chosen_reward, total_pseudo_label_rejected_reward = self.compute_pseudo_label_loss(
+                    else:
+                        # Calculate total pseudo-label loss (over all examples)
+                        total_preference_loss, total_chosen_reward, total_reject_reward = self.compute_pseudo_label_dpo_loss(
                             chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps, pseudo_label_agreement
                         )
                         
@@ -258,23 +263,55 @@ class PPIDPOTrainer(ABC):
                         
                         # Check if we have any gold labels
                         if gold_label_indices.any():
-                            # get the gold label loss on only the gold labels
-                            small_gold_label_loss, chosen_reward, reject_reward = self.loss_fn(
-                                chosen_logps[gold_label_indices], rejected_logps[gold_label_indices], reference_chosen_logps[gold_label_indices], reference_rejected_logps[gold_label_indices]
+                            # Standard DPO loss on gold-labeled data
+                            gold_preference_loss, chosen_reward, reject_reward = self.loss_fn(
+                                chosen_logps[gold_label_indices], 
+                                rejected_logps[gold_label_indices], 
+                                reference_chosen_logps[gold_label_indices], 
+                                reference_rejected_logps[gold_label_indices]
                             )
                             
-                            
-                            # get the pseudo label loss on the same indices
-                            small_pseudo_label_loss, _, _ = self.compute_pseudo_label_loss(
-                                chosen_logps[gold_label_indices], rejected_logps[gold_label_indices], reference_chosen_logps[gold_label_indices], reference_rejected_logps[gold_label_indices], pseudo_label_agreement[gold_label_indices]
+                            # Pseudo-label loss on the same subset with gold labels
+                            pseudo_subset_loss, _, _ = self.compute_pseudo_label_dpo_loss(
+                                chosen_logps[gold_label_indices], 
+                                rejected_logps[gold_label_indices], 
+                                reference_chosen_logps[gold_label_indices], 
+                                reference_rejected_logps[gold_label_indices], 
+                                pseudo_label_agreement[gold_label_indices]
                             )
-                                                        
-                            # doubly robust preference loss
-                            preference_loss = total_pseudo_label_loss - small_pseudo_label_loss + small_gold_label_loss
+                            
+                            # Doubly robust preference loss
+                            preference_loss = total_preference_loss - pseudo_subset_loss + gold_preference_loss
+                            chosen_reward = total_chosen_reward  # Use the rewards from the total calculation
+                            reject_reward = total_reject_reward
                         else:
                             # If no gold labels available, just use the total pseudo label loss
-                            preference_loss, chosen_reward, reject_reward = total_pseudo_label_loss, total_pseudo_label_chosen_reward, total_pseudo_label_rejected_reward
+                            preference_loss = total_preference_loss
+                            chosen_reward = total_chosen_reward
+                            reject_reward = total_reject_reward
                     
+                    assert not torch.isnan(preference_loss), "Preference loss is nan"
+                # 6: training on the pseudo labels and gold labels, where we initially train on only the pseudo labels, then switch to the gold labels after fraction lbda of total training steps. Small set of gold labels
+                elif self.ppi_train_type == 6:
+                    if global_step < switch_steps:
+                        preference_loss, chosen_reward, reject_reward = self.compute_pseudo_label_dpo_loss(
+                            chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps, pseudo_label_agreement
+                        )
+                    else:
+                        gold_label_indices = gold_label_agreement == 1
+                        if gold_label_indices.any():
+                            preference_loss, chosen_reward, reject_reward = self.regular_dpo_loss_fn(
+                                chosen_logps[gold_label_indices], 
+                                rejected_logps[gold_label_indices], 
+                                reference_chosen_logps[gold_label_indices], 
+                                reference_rejected_logps[gold_label_indices]
+                            )
+                        else:
+                            # If no gold labels in this batch, use zero loss (effectively skip this batch)
+                            preference_loss = torch.tensor(0.0, device=torch.cuda.current_device())
+                            chosen_reward = torch.zeros_like(chosen_logps)
+                            reject_reward = torch.zeros_like(rejected_logps)
+                            
                     assert not torch.isnan(preference_loss), "Preference loss is nan"
                     
                 # mixtral
@@ -584,37 +621,48 @@ class PPIDPOTrainer(ABC):
 
         return torch.stack(logprobs_sums), torch.stack(logprobs_means)
 
-    def compute_pseudo_label_loss(self, chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps, pseudo_label_agreement):
-        """Mimics the standard approach but with pseudo label swapping."""
+    def compute_pseudo_label_dpo_loss(self, chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps, pseudo_label_agreement):
+        """Compute DPO loss using only pseudo labels by swapping logprobs based on agreement.
         
-        # For elements where pseudo_label_agreement is 0, we need to swap the inputs
-        # Let's create copies to avoid modifying the originals
-        final_chosen_logps = chosen_logps.clone()
-        final_rejected_logps = rejected_logps.clone()
-        final_ref_chosen_logps = reference_chosen_logps.clone()
-        final_ref_rejected_logps = reference_rejected_logps.clone()
-        
-        # Find indices where we need to swap
-        swap_indices = torch.where(pseudo_label_agreement == 0)[0]
-        
-        # Perform the swap for these indices
-        if len(swap_indices) > 0:
-            # Temporarily store values for the swap
-            temp_chosen = final_chosen_logps[swap_indices].clone()
-            temp_ref_chosen = final_ref_chosen_logps[swap_indices].clone()
+        Args:
+            chosen_logps (torch.Tensor): Log probs for chosen responses
+            rejected_logps (torch.Tensor): Log probs for rejected responses
+            reference_chosen_logps (torch.Tensor): Reference log probs for chosen responses
+            reference_rejected_logps (torch.Tensor): Reference log probs for rejected responses
+            pseudo_label_agreement (torch.Tensor): Binary tensor indicating agreement (1) or disagreement (0)
             
-            # Swap chosen and rejected
-            final_chosen_logps[swap_indices] = final_rejected_logps[swap_indices]
-            final_rejected_logps[swap_indices] = temp_chosen
-            
-            # Also swap reference model outputs
-            final_ref_chosen_logps[swap_indices] = final_ref_rejected_logps[swap_indices]
-            final_ref_rejected_logps[swap_indices] = temp_ref_chosen
+        Returns:
+            tuple: (loss, chosen_reward, reject_reward)
+        """
+        # Create boolean masks for same/different predictions
+        same_mask = pseudo_label_agreement == 1
+        diff_mask = ~same_mask
+
+        # Initialize combined tensors for log probs
+        final_chosen_logps = torch.empty_like(chosen_logps)
+        final_rejected_logps = torch.empty_like(rejected_logps)
+        final_ref_chosen_logps = torch.empty_like(reference_chosen_logps)
+        final_ref_rejected_logps = torch.empty_like(reference_rejected_logps)
+
+        # Assign values based on masks
+        final_chosen_logps[same_mask] = chosen_logps[same_mask]
+        final_chosen_logps[diff_mask] = rejected_logps[diff_mask]
+
+        final_rejected_logps[same_mask] = rejected_logps[same_mask]
+        final_rejected_logps[diff_mask] = chosen_logps[diff_mask]
         
-        # Now call the loss function exactly as it would be called in the standard case
-        return self.loss_fn(
-            final_chosen_logps, 
-            final_rejected_logps, 
-            final_ref_chosen_logps, 
-            final_ref_rejected_logps
-        )
+        final_ref_chosen_logps[same_mask] = reference_chosen_logps[same_mask]
+        final_ref_chosen_logps[diff_mask] = reference_rejected_logps[diff_mask]
+        
+        final_ref_rejected_logps[same_mask] = reference_rejected_logps[same_mask]
+        final_ref_rejected_logps[diff_mask] = reference_chosen_logps[diff_mask]
+        
+        if self.debug:
+            # Check that tensors are properly initialized
+            assert not torch.any(torch.isnan(final_chosen_logps)), "final_chosen_logps contains NaN values"
+            assert not torch.any(torch.isnan(final_rejected_logps)), "final_rejected_logps contains NaN values"
+            assert not torch.any(torch.isnan(final_ref_chosen_logps)), "final_ref_chosen_logps contains NaN values"
+            assert not torch.any(torch.isnan(final_ref_rejected_logps)), "final_ref_rejected_logps contains NaN values"
+
+        # Use the regular DPO loss with the swapped values
+        return self.loss_fn(final_chosen_logps, final_rejected_logps, final_ref_chosen_logps, final_ref_rejected_logps)
