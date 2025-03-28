@@ -19,8 +19,16 @@ pseudo_label_model=$9
 beta=${10}
 
 # Dataset configurations
-dataset=("esfrankel17/HelpSteer2_binarized_w_weak_preferences_cleaned" "esfrankel17/ChatbotArena55k_binarized_w_weak_preferences_cleaned" "esfrankel17/UltraFeedback_binarized_w_weak_preferences_cleaned" "esfrankel17/Nectar_binarized_w_weak_preferences_cleaned")
-dataset_splits=("goodness_score" "winner" "average_rating" "rank")
+target_datasets=("esfrankel17/HelpSteer2_binarized_w_weak_preferences_cleaned" "esfrankel17/ChatbotArena55k_binarized_w_weak_preferences_cleaned" "esfrankel17/ChatbotArena55k_binarized_w_weak_preferences_cleaned" "esfrankel17/Nectar_10_pct_subsample_binarized_w_weak_preferences_cleaned")
+target_splits=("goodness_score" "winner" "winner" "rank")
+dataset=("esfrankel17/UltraFeedback_binarized_w_weak_preferences_cleaned" "esfrankel17/Nectar_binarized_w_weak_preferences_cleaned" "esfrankel17/UltraFeedback_binarized_w_weak_preferences_cleaned" "esfrankel17/ChatbotArena55k_binarized_w_weak_preferences_cleaned")
+dataset_splits=("average_rating" "rank" "average_rating" "winner")
+
+# Validation checks
+if [ ${#dataset[@]} -ne ${#dataset_splits[@]} ] || [ ${#dataset[@]} -ne ${#target_datasets[@]} ] || [ ${#dataset[@]} -ne ${#target_splits[@]} ]; then
+    echo "Error: The length of dataset, dataset_splits, target_datasets, and target_splits must be the same"
+    exit 1
+fi
 
 format_dataset_name() {
     echo $1 | sed 's/^esfrankel17\///' | sed 's/_binarized_w_weak_preferences_cleaned//'
@@ -33,12 +41,15 @@ format_pretrain_model_name() {
 # Get dataset details
 dataset=${dataset[${dataset_idx}]}
 dataset_split=${dataset_splits[${dataset_idx}]}
+target_dataset=${target_datasets[${dataset_idx}]}
+target_split=${target_splits[${dataset_idx}]}
 
 formatted_dataset_name=$(format_dataset_name ${dataset})
+formatted_target_dataset_name=$(format_dataset_name ${target_dataset})
 formatted_pretrain_model_name=$(format_pretrain_model_name ${pretrain_model})
 
-wandb_project=ppi-dpo-in-domain-${formatted_dataset_name}-pretrain-${formatted_pretrain_model_name}-ps-${pseudo_label_model}-pct-gold${percent_gold_label}
-wandb_run_name=ppi_type${ppi_type}-lbda${lbda}-ep${max_epoch}-bs${batch_size}-lr${lr}-beta${beta}
+wandb_project=ppi-dpo-btwn-domain-${formatted_dataset_name}-to-${formatted_target_dataset_name}-pretrain-${formatted_pretrain_model_name}-ps-${pseudo_label_model}-pct-gold${percent_gold_label}
+wandb_run_name=ppi_type${ppi_type}-lbda${lbda}-ep${max_epoch}-bs${batch_size}-lr${lr}
 
 if python check_wandb_run.py --project $wandb_project --name $wandb_run_name; then
     echo "Run is finished"
@@ -51,12 +62,12 @@ fi
 
 # Print the command
 echo "deepspeed --module openrlhf.cli.train_dpo_ppi \
---save_path ./checkpoint/in_domain_dpo_ppi \
---save_steps 1.0 \
+--save_path ./checkpoint/btwn_domain_dpo_ppi \
+--save_pct 1.0 \
 --logging_steps 1 \
---eval_steps 1.0 \
+--eval_pct 0.2 \
 --train_batch_size ${batch_size} \
---micro_train_batch_size 2 \
+--micro_train_batch_size 4 \
 --pretrain ${pretrain_model} \
 --bf16 \
 --max_epochs 1 \
@@ -66,6 +77,8 @@ echo "deepspeed --module openrlhf.cli.train_dpo_ppi \
 --beta ${beta} \
 --dataset ${dataset} \
 --train_split ${dataset_split} \
+--target_dataset ${target_dataset} \
+--target_split ${target_split} \
 --apply_chat_template \
 --chosen_key chosen \
 --rejected_key rejected \
@@ -83,7 +96,7 @@ echo "deepspeed --module openrlhf.cli.train_dpo_ppi \
 --wandb_run_name ${wandb_run_name}"
 
 deepspeed --module openrlhf.cli.train_dpo_ppi \
---save_path ./checkpoint/in_domain_dpo_ppi \
+--save_path ./checkpoint/btwn_domain_dpo_ppi \
 --save_pct 1.0 \
 --logging_steps 1 \
 --eval_pct 0.2 \
@@ -98,6 +111,8 @@ deepspeed --module openrlhf.cli.train_dpo_ppi \
 --beta ${beta} \
 --dataset ${dataset} \
 --train_split ${dataset_split} \
+--target_dataset ${target_dataset} \
+--target_split ${target_split} \
 --apply_chat_template \
 --chosen_key chosen \
 --rejected_key rejected \
